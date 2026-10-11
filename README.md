@@ -35,4 +35,3 @@ git push
 | 仓库 | 内容 |
 |---|---|
 | [merge-yanglukai](https://github.com/merge-games/merge-yanglukai) | 合成杨璐恺（游戏本体） |
-| [game-kit](https://github.com/merge-games/game-kit) | 工具链：可视化生成器 + 模板引擎 + 裁图脚本 |
