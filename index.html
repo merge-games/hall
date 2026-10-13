@@ -108,6 +108,37 @@
 var HALL_TITLE = "游戏大厅";
 var HALL_SUB = "点开即玩 · 手机电脑都支持";
 var HALL_DEDICATION = "谨以此，纪念那些被我们笑过、也被我们记住的大学时光。\n教学楼的风、操场边的玩笑、深夜宿舍里没头没尾的废话，都被收进了这个小小的游戏里。\n合到最后，屏幕会亮起一片金色——就像那几年，谁也没觉得有什么特别，回头看却一直在发光。";
+
+/* ===== 管理员密码（改密码见 README「管理员密码」一节）=====
+   口令不写明文，只存「加盐哈希」两个常量：
+     ADMIN_SALT       随机盐（十六进制串）；换密码时可以在面板里勾选一起换新盐
+     ADMIN_PASS_HASH  hallPassHash(密码) 的结果，固定 16 位十六进制小写
+   默认密码：banzhongwang　（第一次进面板后建议在「F · 安全设置」里改掉）
+   想手工改：浏览器控制台执行 hallPassHash("你的新密码")，把返回值填进 ADMIN_PASS_HASH */
+var ADMIN_SALT = "74743da0ee0c";
+var ADMIN_PASS_HASH = "a930eb04b461c6c8";
+/* 纯 JS 小哈希：FNV-1a(32) 与 djb2(32) 加盐后互相掺混三轮，输出 16 位十六进制。
+   故意不用 crypto.subtle —— file:// 双击打开时它在浏览器里是 undefined。
+   定位是「不让人随手翻一下源码就进面板」，不是强加密，别拿它保护要紧东西。 */
+function hx8(n) {
+  var t = (n >>> 0).toString(16);
+  while (t.length < 8) t = "0" + t;
+  return t;
+}
+function hallPassHash(pass, salt) {
+  var s = String(salt == null ? ADMIN_SALT : salt) + "|" + String(pass == null ? "" : pass);
+  var h1 = 0x811c9dc5, h2 = 5381, r, i, c;
+  for (r = 0; r < 3; r++) {
+    for (i = 0; i < s.length; i++) {
+      c = s.charCodeAt(i) + r * 131;
+      h1 = Math.imul(h1 ^ c, 16777619) >>> 0; /* FNV-1a */
+      h2 = (Math.imul(h2, 33) + c) >>> 0;     /* djb2 */
+    }
+    s = hx8(h1) + hx8(h2);                    /* 上一轮结果当盐，继续掺下一轮 */
+  }
+  return hx8(h1) + hx8(h2);
+}
+
 /* @@HALL-ADMIN-GAMES-START-v1@@ */
 var GAMES = [
   {
@@ -159,13 +190,16 @@ if (hallDedicationEl) hallDedicationEl.textContent = HALL_DEDICATION;
 function renderHall() {
   var grid = document.getElementById("grid");
   grid.innerHTML = "";
-  if (!GAMES.length) {
-    grid.innerHTML = '<div class="empty">还没有游戏，先在 GAMES 里加一条吧</div>';
+  /* on 缺省视为 true：老清单里没写 on 的条目照常显示 */
+  var show = GAMES.filter(function (g) { return g.on !== false; });
+  if (!show.length) {
+    grid.innerHTML = '<div class="empty">' +
+      (GAMES.length ? "管理员把游戏都先收起来了，稍后再来" : "还没有游戏，先在 GAMES 里加一条吧") + '</div>';
     if (typeof updateDiagMeta === "function") updateDiagMeta();
     return;
   }
   var frag = document.createDocumentFragment();
-  GAMES.forEach(function (g) {
+  show.forEach(function (g) {
     var a = document.createElement("a");
     a.className = "card";
     a.href = g.url;
@@ -215,6 +249,11 @@ renderHall();
   /* ---------- 常量与全局（只在触发后才被用到） ---------- */
   var ACCESS_KEY = "admin";
   var TOKEN_KEY = "hall-admin:token:v1";
+  /* 密码门「记住本机」：只存一个解锁标记，不存口令、不存哈希 */
+  var UNLOCK_KEY = "hall-admin:unlocked:v1";
+  var MAX_TRIES = 3;        /* 连续输错几次进入冷却 */
+  var COOLDOWN_MS = 10000;  /* 冷却时长（毫秒） */
+  var MIN_PASS_LEN = 4;     /* 新密码最短长度 */
   var REPO = { owner: "merge-games", repo: "hall", path: "index.html", branch: "main", file: "index.html" };
   /* 源码编辑器：可读写的仓库，以及每个仓库预置的常用文件入口 */
   var REPOS = ["hall", "merge-yanglukai", "jump-yanglukai", "fruit-yanglukai", "galgame-yanglukai", "game-kit"];
@@ -246,10 +285,14 @@ renderHall();
   };
 
   var adminOpen = false;      // 面板是否已构建
-  var overlayEl = null;       // 覆盖层
+  var gateOpen = false;       // 密码门是否已构建
+  var overlayEl = null;       // 覆盖层（密码门与面板共用同一个 #hallAdminRoot）
   var refs = {};              // 常用节点缓存
   var snap = null;            // 本次打开时的原始配置快照
   var buildForSaveError = ""; // 上次 buildForSave 失败原因（用于自检显式暴露）
+  var triesLeft = MAX_TRIES;  // 冷却前还剩几次输入机会
+  var cdUntil = 0;            // 冷却结束的时间戳（0 = 不在冷却）
+  var cdTimer = null;         // 冷却倒计时定时器
 
   var errCount = 0;           // 运行时错误计数（面板「自检」可见）
   var errLast = "";
@@ -349,8 +392,8 @@ renderHall();
     return { start: start, open: open, close: close };
   }
 
-  /* ---------- 把面板状态写回文件：只替换 GAMES 声明 + 三个配置变量赋值 ---------- */
-  function buildModifiedHtml(src, games, title, sub, dedication) {
+  /* ---------- 把面板状态写回文件：只替换 GAMES 声明 + 配置变量赋值 ---------- */
+  function buildModifiedHtml(src, games, title, sub, dedication, sec) {
     var range = findGamesRange(src);
     if (!range) return { ok: false, error: "没找到 GAMES 代码块，请确认当前文件是原始的 index.html" };
     var head = src.slice(0, range.start);        // 到 "var GAMES" 之前
@@ -366,8 +409,28 @@ renderHall();
     out = replaceVar(out, "HALL_TITLE", title);
     out = replaceVar(out, "HALL_SUB", sub);
     out = replaceVar(out, "HALL_DEDICATION", dedication);
+    /* 密码常量：只有显式传了 sec 才写，避免日常改清单时误动密码 */
+    if (sec) {
+      if (sec.salt != null) out = replaceVar(out, "ADMIN_SALT", sec.salt);
+      if (sec.hash != null) out = replaceVar(out, "ADMIN_PASS_HASH", sec.hash);
+    }
     return { ok: true, html: out };
   }
+  /* 读出源码里 var NAME = "字面量" 的那段字面量（含引号）；读不到返回 null。
+     用途：产物自检时确认 ADMIN_SALT / ADMIN_PASS_HASH 真的按预期写进去了。 */
+  function readVarLiteral(src, name) {
+    var key = "var " + name;
+    var at = src.indexOf(key);
+    if (at < 0) return null;
+    var eq = src.indexOf("=", at + key.length);
+    if (eq < 0) return null;
+    var v = eq + 1;
+    while (v < src.length && /\s/.test(src.charAt(v))) v++;
+    var c = src.charAt(v);
+    if (c !== '"' && c !== "'" && c !== "`") return null;
+    return src.slice(v, skipString(src, v));
+  }
+  function currentSec() { return { salt: ADMIN_SALT, hash: ADMIN_PASS_HASH }; }
   /* 替换形如 var NAME = <表达式>; 的赋值（只替换第一处）。
      用扫描器找字符串字面量的结尾，避免值里出现分号（如中文简介里的 ";"）时被截断。 */
   function replaceVar(src, name, value) {
@@ -398,7 +461,8 @@ renderHall();
       .replace(/\u2028/g, "\\u2028")
       .replace(/\u2029/g, "\\u2029") + '"';
   }
-  /* 只产出数组字面量 "[ … ]"；写回文件时沿用原文件里的那个分号 */
+  /* 只产出数组字面量 "[ … ]"；写回文件时沿用原文件里的那个分号。
+     on 字段永远显式写出来：true = 在大厅显示，false = 大厅里隐藏。 */
   function gamesArrayCode(list) {
     var b = "[";
     for (var i = 0; i < list.length; i++) {
@@ -409,7 +473,8 @@ renderHall();
         "    desc: " + jsStr(g.desc || "") + ",\n" +
         "    url: " + jsStr(g.url) + ",\n" +
         "    cover: " + jsStr(g.cover || "") + ",\n" +
-        "    tag: " + jsStr(g.tag || "") + "\n" +
+        "    tag: " + jsStr(g.tag || "") + ",\n" +
+        "    on: " + (g.on === false ? "false" : "true") + "\n" +
         "  }";
     }
     return b + "\n]";
@@ -484,6 +549,13 @@ renderHall();
       "#hallAdminRoot .ha-toast.show{opacity:1;}",
       "#hallAdminRoot .ha-toast.err{background:#9a2130;}",
       "#hallAdminRoot a{color:#9a2130;word-break:break-all;}",
+      "#hallAdminRoot label.ha-on{display:inline-flex;align-items:center;gap:5px;color:#8a7376;font-size:11.5px;cursor:pointer;letter-spacing:.04em;white-space:nowrap;}",
+      "#hallAdminRoot label.ha-on input{width:auto;margin:0;}",
+      "#hallAdminRoot .ha-item[data-on=\"0\"]{background:#fbf3f1;border-style:dashed;}",
+      "#hallAdminRoot .ha-item[data-on=\"0\"] .ha-lab{color:#b9a6a8;}",
+      "#hallAdminRoot .ha-gate{width:min(460px,100%);}",
+      "#hallAdminRoot .ha-gate input[type=password]{letter-spacing:.14em;}",
+      "#hallAdminRoot .ha-cd{color:#9a2130;font-weight:700;}",
       "@media(max-width:430px){#hallAdminRoot .ha-grid2,#hallAdminRoot .ha-grid5{grid-template-columns:1fr;}}"
     ].join("");
     var s = document.createElement("style");
@@ -495,7 +567,7 @@ renderHall();
   function field(labelText, value, placeholder) {
     var w = el("div");
     w.appendChild(el("label", "ha-lab", labelText));
-    var i = el("input", null, null);
+    var i = el("input", "ha-in", null);
     i.type = "text";
     i.value = value == null ? "" : value;
     if (placeholder) i.placeholder = placeholder;
@@ -507,10 +579,22 @@ renderHall();
   function buildItem(g, i) {
     var box = el("div", "ha-item");
     box._index = i;
+    var on = (g.on !== false);
+    box.setAttribute("data-on", on ? "1" : "0");
     var head = el("div", "ha-itemhead");
     head.appendChild(el("span", "ha-no", "#" + (i + 1)));
     head.appendChild(el("span", "ha-lab", g.title || "(未命名)"));
     head.appendChild(el("span", "ha-spacer"));
+    /* 【需求 2】每条一个「在大厅显示」勾选框，勾掉就不渲染这张卡片 */
+    var onLab = el("label", "ha-on");
+    var onBox = el("input");
+    onBox.type = "checkbox";
+    onBox.className = "ha-onbox";
+    onBox.id = "haOn" + i;
+    onBox.checked = on;
+    onLab.appendChild(onBox);
+    onLab.appendChild(document.createTextNode("在大厅显示"));
+    head.appendChild(onLab);
     var up = el("button", null, "↑ 上移");
     var dn = el("button", null, "↓ 下移");
     var del = el("button", "ha-danger", "删除");
@@ -532,12 +616,14 @@ renderHall();
     g5.appendChild(field("标签", g.tag, "可留空"));
     box.appendChild(g5);
 
-    var inputs = box.querySelectorAll("input");
+    var inputs = box.querySelectorAll("input.ha-in");
     box._title = inputs[0];
     box._url = inputs[1];
     box._desc = inputs[2];
     box._cover = inputs[3];
     box._tag = inputs[4];
+    box._on = onBox;
+    onBox._box = box; /* 反向引用，供「全部显示/隐藏」批量改外观 */
     /* 输入即重渲染大厅卡片（所见即所得）；非法时红字提示、不回写 */
     function onInput() {
       var list = collectGames();
@@ -549,6 +635,12 @@ renderHall();
     }
     [box._title, box._desc, box._url, box._cover, box._tag].forEach(function (inp) {
       inp.addEventListener("input", onInput);
+    });
+    /* 勾选框走 change：实时联动卡片 + 顺手刷新「已隐藏」外观 */
+    onBox.addEventListener("change", function () {
+      box.setAttribute("data-on", onBox.checked ? "1" : "0");
+      onInput();
+      toast((onBox.checked ? "已在大厅显示：" : "已在大厅隐藏：") + (box._title.value.trim() || ("第 " + (i + 1) + " 条")));
     });
     return box;
   }
@@ -564,7 +656,8 @@ renderHall();
         desc: b._desc.value,
         url: b._url.value.trim(),
         cover: b._cover.value.trim(),
-        tag: b._tag.value.trim()
+        tag: b._tag.value.trim(),
+        on: !!(b._on && b._on.checked)
       });
     }
     return out;
@@ -583,7 +676,7 @@ renderHall();
 
   function fillList(selectIndex) {
     var games = snap.games.map(function (g) {
-      return { title: g.title, desc: g.desc, url: g.url, cover: g.cover, tag: g.tag };
+      return { title: g.title, desc: g.desc, url: g.url, cover: g.cover, tag: g.tag, on: g.on !== false };
     });
     refs.list.innerHTML = "";
     games.forEach(function (g, i) { refs.list.appendChild(buildItem(g, i)); });
@@ -659,7 +752,7 @@ renderHall();
     return "<!DOCTYPE html>\n" + root.outerHTML;
   }
   /* 产物自检：宁可不让下载/发布，也不能把页面写坏 */
-  function verifyOutput(html, games) {
+  function verifyOutput(html, games, sec) {
     if (html.slice(0, 20).indexOf("<!DOCTYPE") !== 0) return "产物缺少 <!DOCTYPE html>";
     var r = findGamesRange(html);
     if (!r) return "产物里找不到 GAMES 声明";
@@ -671,6 +764,14 @@ renderHall();
     if (html.indexOf(NEEDLE_PANEL) >= 0 || html.indexOf(NEEDLE_STYLE) >= 0) {
       return "产物里混进了管理面板节点";
     }
+    /* 密码常量：必须存在、格式合法、且与预期一致（改密码时这里是最后一道闸） */
+    var want = sec || currentSec();
+    var litSalt = readVarLiteral(html, "ADMIN_SALT");
+    var litHash = readVarLiteral(html, "ADMIN_PASS_HASH");
+    if (litSalt == null || litHash == null) return "产物里找不到 ADMIN_SALT / ADMIN_PASS_HASH 常量";
+    if (!/^"[0-9a-f]{16}"$/.test(litHash)) return "产物的 ADMIN_PASS_HASH 不是 16 位十六进制";
+    if (jsStr(want.salt) !== litSalt) return "产物里的 ADMIN_SALT 和预期不一致";
+    if (jsStr(want.hash) !== litHash) return "产物里的 ADMIN_PASS_HASH 和预期不一致";
     return "";
   }
   function buildForSave() {
@@ -679,9 +780,9 @@ renderHall();
     showErrors(errs);
     if (errs.length) { buildForSaveError = "校验未通过"; toast("存在问题，未保存", "err"); return null; }
     var st = snapshotNow();
-    var r = buildModifiedHtml(cleanSource(), st.games, st.title, st.sub, st.dedication);
+    var r = buildModifiedHtml(cleanSource(), st.games, st.title, st.sub, st.dedication, currentSec());
     if (!r.ok) { buildForSaveError = r.error; toast("生成失败：" + r.error, "err"); return null; }
-    var bad = verifyOutput(r.html, st.games);
+    var bad = verifyOutput(r.html, st.games, currentSec());
     if (bad) { buildForSaveError = bad; toast("产物自检失败：" + bad, "err"); return null; }
     return r.html;
   }
@@ -1187,12 +1288,193 @@ renderHall();
     refs.selfcheck.textContent = "运行时错误：" + errCount + (errLast ? "（" + errLast + "）" : "");
   }
 
+  /* ---------- 覆盖层：密码门与面板共用同一个 #hallAdminRoot ---------- */
+  function ensureOverlay() {
+    injectStyle();
+    if (!overlayEl) {
+      overlayEl = el("div");
+      overlayEl.id = "hallAdminRoot";
+      overlayEl.addEventListener("click", function (e) { if (e.target === overlayEl) close(); });
+      document.body.appendChild(overlayEl);
+    }
+    overlayEl.innerHTML = "";
+    return overlayEl;
+  }
+
+  /* =====================================================================
+     需求 1：管理员密码门
+     三种入口触发后先出这一屏，口令对上了才构建管理面板。
+     口令只以「盐 + 哈希」形式存在源码里（ADMIN_SALT / ADMIN_PASS_HASH），
+     校验走纯 JS 的 hallPassHash()，不碰 crypto.subtle（file:// 下不可用）。
+     ===================================================================== */
+  function storageOk() {
+    try { localStorage.getItem("__ha_probe__"); return true; } catch (e) { return false; }
+  }
+  function isRemembered() {
+    try { return localStorage.getItem(UNLOCK_KEY) === "1"; } catch (e) { return false; }
+  }
+  /* 「记住本机」只写一个解锁标记，不写口令也不写哈希 */
+  function setRemembered(on) {
+    try {
+      if (on) localStorage.setItem(UNLOCK_KEY, "1");
+      else localStorage.removeItem(UNLOCK_KEY);
+      return true;
+    } catch (e) { return false; }
+  }
+  function cdLeft() { return Math.max(0, cdUntil - Date.now()); }
+  function passwordOk(pw) {
+    var p = String(pw == null ? "" : pw);
+    if (!p) return false;
+    return hallPassHash(p, ADMIN_SALT) === ADMIN_PASS_HASH;
+  }
+  function gateSay(text, isError) {
+    if (!refs.gateMsg) return;
+    refs.gateMsg.className = "ha-err" + (text ? " show" : "");
+    refs.gateMsg.style.color = isError ? "#9a2130" : "#8a7376";
+    refs.gateMsg.style.background = isError ? "#fbe9e7" : "#f6efec";
+    refs.gateMsg.style.borderColor = isError ? "#f0c9c3" : "#ecdedb";
+    refs.gateMsg.textContent = text || "";
+  }
+  function startCooldown() {
+    cdUntil = Date.now() + COOLDOWN_MS;
+    triesLeft = 0;
+    tickCooldown();
+  }
+  /* 冷却倒计时：按钮上直接写还剩几秒，输入框锁死 */
+  function tickCooldown() {
+    if (!gateOpen) return;
+    var left = cdLeft();
+    if (left <= 0) {
+      cdUntil = 0;
+      triesLeft = MAX_TRIES;
+      if (cdTimer) { clearTimeout(cdTimer); cdTimer = null; }
+      if (refs.gatePw) refs.gatePw.disabled = false;
+      if (refs.gateBtn) { refs.gateBtn.disabled = false; refs.gateBtn.textContent = "进入管理面板"; }
+      gateSay("");
+      return;
+    }
+    if (refs.gatePw) refs.gatePw.disabled = true;
+    if (refs.gateBtn) {
+      refs.gateBtn.disabled = true;
+      refs.gateBtn.textContent = "冷却中 " + Math.ceil(left / 1000) + " 秒";
+    }
+    gateSay("⚠ 密码连续输错 " + MAX_TRIES + " 次，冷却中：还剩 " + Math.ceil(left / 1000) + " 秒", true);
+    cdTimer = setTimeout(tickCooldown, 200);
+  }
+  /* 校验并提交密码门。返回是否通过（自动化测试也走这一条真实路径） */
+  function submitGate() {
+    if (!gateOpen || !refs.gatePw) return false;
+    if (cdLeft() > 0) { tickCooldown(); return false; }
+    var pw = refs.gatePw.value;
+    if (!pw) { gateSay("请输入管理员密码", true); return false; }
+    if (!passwordOk(pw)) {
+      triesLeft--;
+      refs.gatePw.value = "";                       /* 输错就清空 */
+      if (triesLeft <= 0) startCooldown();
+      else gateSay("密码不对，还可以再试 " + triesLeft + " 次", true);
+      return false;
+    }
+    triesLeft = MAX_TRIES;
+    if (refs.gateRemember && refs.gateRemember.checked) setRemembered(true);
+    openPanel();
+    return true;
+  }
+  function pwField(labelText, id, placeholder) {
+    var w = el("div");
+    w.appendChild(el("label", "ha-lab", labelText));
+    var i = el("input");
+    i.type = "password";
+    i.id = id;
+    i.autocomplete = "new-password";
+    if (placeholder) i.placeholder = placeholder;
+    w.appendChild(i);
+    w._input = i;
+    return w;
+  }
+  function buildGate(msg) {
+    var root = ensureOverlay();
+    var card = el("div", "ha-panel ha-gate");
+    card.id = "haGateCard";
+
+    var head = el("div", "ha-head");
+    head.appendChild(el("h2", null, "管理员验证"));
+    head.appendChild(el("span", "ha-badge", "隐藏入口"));
+    head.appendChild(el("span", "ha-spacer"));
+    var cancel = el("button", null, "取消");
+    cancel.id = "haGateCancel";
+    head.appendChild(cancel);
+    card.appendChild(head);
+
+    var tip = el("div", "ha-note", "面板有改动大厅的权限，先验证管理员密码。密码与 GitHub Token 是两回事；" +
+      "默认密码和改法见 README「管理员密码」一节。");
+    tip.style.marginTop = "10px";
+    card.appendChild(tip);
+
+    var pwWrap = pwField("管理员密码", "haGatePw", "请输入密码");
+    pwWrap.style.marginTop = "12px";
+    refs.gatePw = pwWrap._input;
+    card.appendChild(pwWrap);
+
+    var row = el("div", "ha-row");
+    row.style.marginTop = "10px";
+    refs.gateBtn = el("button", "ha-primary", "进入管理面板");
+    refs.gateBtn.id = "haGateGo";
+    row.appendChild(refs.gateBtn);
+    var remLab = el("label");
+    remLab.className = "ha-on";
+    refs.gateRemember = el("input");
+    refs.gateRemember.type = "checkbox";
+    refs.gateRemember.id = "haGateRemember";
+    remLab.appendChild(refs.gateRemember);
+    remLab.appendChild(document.createTextNode("记住本机（localStorage 只存解锁标记）"));
+    row.appendChild(remLab);
+    card.appendChild(row);
+
+    /* file:// 或不透明源下浏览器会禁掉 localStorage：勾选框直接禁用并说明 */
+    var noStore = false;
+    try { noStore = (location.protocol === "file:") || !storageOk(); } catch (e) { noStore = true; }
+    if (noStore) {
+      refs.gateRemember.disabled = true;
+      refs.gateRemember.checked = false;
+      var wn = el("div", "ha-note", "当前是 file:// 打开（或浏览器禁用了本站 localStorage），没法「记住本机」，每次都要重新输密码。");
+      wn.style.marginTop = "6px";
+      card.appendChild(wn);
+    }
+
+    refs.gateMsg = el("div", "ha-err");
+    refs.gateMsg.id = "haGateMsg";
+    card.appendChild(refs.gateMsg);
+
+    var hint = el("div", "ha-note", "忘记密码：在 GitHub 上打开本文件，把 ADMIN_PASS_HASH 换成新口令的哈希即可" +
+      "（README「管理员密码」一节给了算法，以及在浏览器控制台里一行算出来的办法）。");
+    hint.style.marginTop = "12px";
+    card.appendChild(hint);
+
+    var stat = el("div", "ha-note", "本机解锁标记：" + (isRemembered() ? "有（可直接进面板）" : "无"));
+    stat.style.marginTop = "4px";
+    card.appendChild(stat);
+
+    root.appendChild(card);
+
+    refs.gatePw.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.keyCode === 13) { e.preventDefault(); submitGate(); }
+    });
+    refs.gateBtn.addEventListener("click", submitGate);
+    cancel.addEventListener("click", function () { close(); });
+
+    if (msg) gateSay(msg, false);
+    if (cdLeft() > 0) tickCooldown();
+    else {
+      setTimeout(function () {
+        if (gateOpen && refs.gatePw && !refs.gatePw.disabled) { try { refs.gatePw.focus(); } catch (e) {} }
+      }, 30);
+    }
+    return card;
+  }
+
   /* ---------- 面板总装 ---------- */
   function build() {
-    injectStyle();
-    overlayEl = el("div");
-    overlayEl.id = "hallAdminRoot";
-
+    var root = ensureOverlay();
     var panel = el("div", "ha-panel");
 
     /* 头部 */
@@ -1200,12 +1482,16 @@ renderHall();
     head.appendChild(el("h2", null, "大厅管理员面板"));
     head.appendChild(el("span", "ha-badge", "隐藏入口"));
     head.appendChild(el("span", "ha-spacer"));
+    var lockBtn = el("button", null, "锁定");
+    lockBtn.id = "haLock";
+    lockBtn.title = "清掉本机解锁标记，并回到密码门";
+    head.appendChild(lockBtn);
     var exit = el("button", "ha-primary", "退出管理");
     exit.id = "haExit";
     head.appendChild(exit);
     panel.appendChild(head);
 
-    var tip = el("div", "ha-note", "入口：网址加 ?admin=1 或 #admin，或 2 秒内连点页面标题 5 次。面板内所有改动会立刻反映到下方页面卡片上。");
+    var tip = el("div", "ha-note", "入口：网址加 ?admin=1 或 #admin，或 2 秒内连点页面标题 5 次（每次都要先过密码门）。面板内所有改动会立刻反映到下方页面卡片上。");
     tip.style.marginTop = "10px";
     panel.appendChild(tip);
 
@@ -1216,7 +1502,12 @@ renderHall();
     addBtn.id = "haAdd";
     var resetBtn = el("button", null, "恢复本次打开时的内容");
     resetBtn.id = "haReset";
+    var showAllBtn = el("button", null, "全部显示");
+    showAllBtn.id = "haShowAll";
+    var hideAllBtn = el("button", null, "全部隐藏");
+    hideAllBtn.id = "haHideAll";
     toolbar.appendChild(addBtn); toolbar.appendChild(resetBtn);
+    toolbar.appendChild(showAllBtn); toolbar.appendChild(hideAllBtn);
     panel.appendChild(toolbar);
     refs.list = el("div", "ha-list");
     refs.list.id = "haList";
@@ -1397,6 +1688,56 @@ renderHall();
     refs.stats.id = "haStats";
     panel.appendChild(refs.stats);
 
+    /* F) 安全设置：改密码（写回源码常量 → 产物自检 → 发布/复制） */
+    panel.appendChild(el("h3", null, "F · 安全设置（改管理员密码）"));
+    var secTip = el("div", "ha-note", "改完点下面的按钮：用新口令算哈希、把 ADMIN_SALT / ADMIN_PASS_HASH 写回源码，" +
+      "再走一遍产物自检，最后发布到 GitHub（没填 Token 就复制整页 / 让你手动下载替换）。");
+    secTip.style.marginTop = "-4px";
+    panel.appendChild(secTip);
+
+    var secGrid = el("div", "ha-grid2");
+    secGrid.style.marginTop = "8px";
+    refs.sec1W = pwField("新密码（至少 " + MIN_PASS_LEN + " 位）", "haSecNew", "新密码");
+    refs.sec1 = refs.sec1W._input;
+    refs.sec2W = pwField("再输一次", "haSecNew2", "重复新密码");
+    refs.sec2 = refs.sec2W._input;
+    secGrid.appendChild(refs.sec1W);
+    secGrid.appendChild(refs.sec2W);
+    panel.appendChild(secGrid);
+
+    var secRow = el("div", "ha-row");
+    secRow.style.marginTop = "10px";
+    refs.secRotateLab = el("label");
+    refs.secRotateLab.className = "ha-on";
+    refs.secRotate = el("input");
+    refs.secRotate.type = "checkbox";
+    refs.secRotate.id = "haSecRotate";
+    refs.secRotate.checked = true;
+    refs.secRotateLab.appendChild(refs.secRotate);
+    refs.secRotateLab.appendChild(document.createTextNode("同时换一个随机盐（推荐）"));
+    secRow.appendChild(refs.secRotateLab);
+    refs.secBtn = el("button", "ha-primary", "更新密码并发布");
+    refs.secBtn.id = "haSecApply";
+    secRow.appendChild(refs.secBtn);
+    refs.secPlanBtn = el("button", null, "只算新哈希（不动文件）");
+    refs.secPlanBtn.id = "haSecPlan";
+    secRow.appendChild(refs.secPlanBtn);
+    panel.appendChild(secRow);
+
+    refs.secNow = el("div", "ha-note", "");
+    refs.secNow.id = "haSecNow";
+    refs.secNow.style.marginTop = "8px";
+    panel.appendChild(refs.secNow);
+
+    refs.secMsg = el("div", "ha-err");
+    refs.secMsg.id = "haSecMsg";
+    panel.appendChild(refs.secMsg);
+
+    var secWarn = el("div", "ha-warn", "");
+    secWarn.style.marginTop = "8px";
+    secWarn.textContent = "说明：口令校验是纯前端比对，源码公开，本质上只是「挡住随手翻源码的人」。改完密码请把新文件真的发布/替换上去，否则线上还是旧口令。";
+    panel.appendChild(secWarn);
+
     panel.appendChild(el("h3", null, "自检"));
     refs.selfcheck = el("div", "ha-note", "运行时错误：0");
     refs.selfcheck.id = "haSelfcheck";
@@ -1406,21 +1747,20 @@ renderHall();
     refs.toast.id = "haToast";
     panel.appendChild(refs.toast);
 
-    overlayEl.appendChild(panel);
-    document.body.appendChild(overlayEl);
+    root.appendChild(panel);
 
     /* ---- 事件 ---- */
     exit.addEventListener("click", function () { close(); });
-    overlayEl.addEventListener("click", function (e) { if (e.target === overlayEl) close(); });
-    document.addEventListener("keydown", function (e) {
-      if (adminOpen && (e.key === "Escape" || e.keyCode === 27)) close();
-    });
+    lockBtn.addEventListener("click", function () { lockToGate(); });
     addBtn.addEventListener("click", function () {
       var list = collectGames();
-      list.push({ title: "新游戏", desc: "", url: "https://merge-games.github.io/", cover: "", tag: "" });
+      list.push({ title: "新游戏", desc: "", url: "https://merge-games.github.io/", cover: "", tag: "", on: true });
       applyList(list, list.length - 1);
       toast("已新增一条（记得改标题和链接）");
     });
+    /* 【需求 2】一键全部显示 / 全部隐藏 */
+    showAllBtn.addEventListener("click", function () { setAllOn(true); toast("已把所有游戏设为「在大厅显示」"); });
+    hideAllBtn.addEventListener("click", function () { setAllOn(false); toast("已把所有游戏设为「在大厅隐藏」，导出/发布后线上才生效"); });
     resetBtn.addEventListener("click", function () {
       applyList(clone(snap.games), 0);
       refs.t1.value = snap.title; refs.t2.value = snap.sub; refs.t3.value = snap.dedication;
@@ -1480,7 +1820,105 @@ renderHall();
     srcState.path = "index.html";
     srcStatus();
 
+    /* F 安全设置的事件 */
+    refs.secPlanBtn.addEventListener("click", function () {
+      var plan = planPassword(refs.sec1.value, refs.sec2.value, refs.secRotate.checked);
+      if (!plan.ok) { secSay("⚠ " + plan.error, true); return; }
+      secSay("新盐 " + plan.salt + " → 新哈希 " + plan.hash + "（还没写进文件）", false);
+    });
+    refs.secBtn.addEventListener("click", function () {
+      var plan = applyPassword(refs.sec1.value, refs.sec2.value, refs.secRotate.checked);
+      if (plan.ok) { refs.sec1.value = ""; refs.sec2.value = ""; refreshSecNow(); }
+    });
+    refs.sec1.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.keyCode === 13) e.preventDefault(); });
+    refreshSecNow();
+
     paintErr();
+  }
+
+  /* F 区状态行：把当前生效的常量摊开，手改源码时好对照 */
+  function refreshSecNow() {
+    if (!refs.secNow) return;
+    refs.secNow.textContent = "当前生效：ADMIN_SALT = \"" + ADMIN_SALT + "\"　·　ADMIN_PASS_HASH = \"" + ADMIN_PASS_HASH + "\"" +
+      "　·　本机解锁标记：" + (isRemembered() ? "有" : "无") +
+      "　·　连续输错 " + MAX_TRIES + " 次冷却 " + (COOLDOWN_MS / 1000) + " 秒";
+  }
+  function secSay(text, isError) {
+    if (!refs.secMsg) return;
+    refs.secMsg.className = "ha-err" + (text ? " show" : "");
+    refs.secMsg.style.color = isError ? "#9a2130" : "#2f6b3b";
+    refs.secMsg.style.background = isError ? "#fbe9e7" : "#eaf5ec";
+    refs.secMsg.style.borderColor = isError ? "#f0c9c3" : "#c6e2cb";
+    refs.secMsg.textContent = text || "";
+  }
+  /* 新的随机盐：优先用 crypto.getRandomValues（不需要安全上下文），失败退到 Math.random */
+  function newSalt() {
+    var hex = "0123456789abcdef", s = "", i;
+    try {
+      var a = new Uint8Array(6);
+      crypto.getRandomValues(a);
+      for (i = 0; i < a.length; i++) s += hex.charAt(a[i] & 15) + hex.charAt((a[i] >> 4) & 15);
+      if (s.length === 12) return s;
+    } catch (e) { /* 没有 crypto 就用下面的兜底 */ }
+    s = "";
+    for (i = 0; i < 12; i++) s += hex.charAt(Math.floor(Math.random() * 16));
+    return s;
+  }
+  /* 只算哈希、不动文件 */
+  function planPassword(pw, pw2, rotateSalt) {
+    var p = String(pw == null ? "" : pw);
+    if (!p) return { ok: false, error: "新密码不能为空" };
+    if (p.length < MIN_PASS_LEN) return { ok: false, error: "新密码至少 " + MIN_PASS_LEN + " 位" };
+    if (p !== String(pw2 == null ? "" : pw2)) return { ok: false, error: "两次输入的密码不一样" };
+    var salt = rotateSalt ? newSalt() : ADMIN_SALT;
+    return { ok: true, salt: salt, hash: hallPassHash(p, salt), rotated: !!rotateSalt };
+  }
+  /* 真正改密码：改内存常量 → 生成产物（含产物自检）→ 有 Token 就发布，没有就复制整页 */
+  function applyPassword(pw, pw2, rotateSalt) {
+    var plan = planPassword(pw, pw2, rotateSalt);
+    if (!plan.ok) { secSay("⚠ " + plan.error, true); return plan; }
+    var oldSalt = ADMIN_SALT, oldHash = ADMIN_PASS_HASH;
+    plan.oldHash = oldHash;
+    ADMIN_SALT = plan.salt;
+    ADMIN_PASS_HASH = plan.hash;
+    var html = buildForSave();
+    if (!html) {
+      /* 自检没过就回滚，别让页面停在一个谁也进不去的密码上 */
+      ADMIN_SALT = oldSalt;
+      ADMIN_PASS_HASH = oldHash;
+      plan.ok = false;
+      plan.error = "产物自检未通过，已回滚：" + buildForSaveError;
+      secSay("⚠ " + plan.error, true);
+      return plan;
+    }
+    plan.html = html;
+    plan.bytes = html.length;
+    var token = refs.token ? refs.token.value.trim() : "";
+    if (token) {
+      refs.publishBtn.disabled = true;
+      secSay("密码已改，正在发布新文件…", false);
+      publish(token, html, "更新管理员密码（管理员面板 " + nowText() + "）").then(function (r) {
+        refs.publishBtn.disabled = false;
+        paintPublish(r, "✅ 密码已更新并发布成功。Pages 约 1 分钟内生效，之后用新密码进面板。", false);
+        secSay("✅ 密码已更新，并已发布到 GitHub（" + (r.commit || "提交成功") + "）", false);
+        refreshSecNow();
+      }).catch(function (e) {
+        refs.publishBtn.disabled = false;
+        var m = e && e.message ? e.message : String(e);
+        paintPublish(null, "❌ 密码已改但发布失败：" + m, true);
+        secSay("⚠ 新密码已在本页生效，但发布失败：" + m + "。可以点「② 下载 index.html」手动替换仓库文件。", true);
+        refreshSecNow();
+      });
+    } else {
+      copyText(html).then(function () {
+        secSay("✅ 密码已更新（本页立即生效）。没填 GitHub Token，已把改好的整页复制到剪贴板；" +
+          "也可以点「② 下载 index.html」手动替换仓库里的文件。", false);
+      }).catch(function () {
+        secSay("✅ 密码已更新（本页立即生效）。没填 GitHub Token，也复制失败，请点「② 下载 index.html」手动替换。", false);
+      });
+      refreshSecNow();
+    }
+    return plan;
   }
 
   /* 用给定清单重建列表（供新增/删除/排序使用） */
@@ -1492,6 +1930,22 @@ renderHall();
     if (typeof selectIndex === "number" && refs.list.children[selectIndex]) {
       refs.list.children[selectIndex].scrollIntoView({ block: "nearest" });
     }
+  }
+  /* 「全部显示 / 全部隐藏」：直接改 DOM 里的勾选框，再走一次统一回写 */
+  function setAllOn(on) {
+    if (!refs.list) return false;
+    var boxes = refs.list.querySelectorAll("input.ha-onbox");
+    for (var i = 0; i < boxes.length; i++) {
+      boxes[i].checked = !!on;
+      if (boxes[i]._box && boxes[i]._box.setAttribute) boxes[i]._box.setAttribute("data-on", on ? "1" : "0");
+    }
+    var list = collectGames();
+    var errs = validateGames(list);
+    showErrors(errs);
+    if (errs.length) return false;
+    GAMES = list;
+    renderHall();
+    return true;
   }
   /* 把面板当前内容以 meta 属性形式写进 DOM，方便无头浏览器在 file:// 下断言（普通访客看不到） */
   function updateDiagMeta() {
@@ -1535,17 +1989,36 @@ renderHall();
   function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
   /* ---------- 开关 ---------- */
-  function open() {
-    if (adminOpen) return;
-    adminOpen = true;
+  function takeSnapshot() {
     snap = {
       games: GAMES.map(function (g) {
-        return { title: g.title, desc: g.desc, url: g.url, cover: g.cover, tag: g.tag };
+        return { title: g.title, desc: g.desc, url: g.url, cover: g.cover, tag: g.tag, on: g.on !== false };
       }),
       title: HALL_TITLE,
       sub: HALL_SUB,
       dedication: HALL_DEDICATION
     };
+  }
+  /* 触发入口之后：先过密码门。已勾「记住本机」的机器直接进面板 */
+  function open() {
+    if (adminOpen || gateOpen) return false;
+    if (isRemembered()) { openPanel(); return true; }
+    return openGate("");
+  }
+  function openGate(msg) {
+    if (adminOpen || gateOpen) return false;
+    gateOpen = true;
+    buildGate(msg || "");
+    stripAccessFlag();
+    return true;
+  }
+  function openPanel() {
+    adminOpen = true;
+    gateOpen = false;
+    if (cdTimer) { clearTimeout(cdTimer); cdTimer = null; }
+    cdUntil = 0;
+    triesLeft = MAX_TRIES;
+    takeSnapshot();
     build();
     fillList();
     refs.t1.value = HALL_TITLE;
@@ -1555,10 +2028,20 @@ renderHall();
     renderStats();
     updateDiagMeta();
     stripAccessFlag();
+    return true;
+  }
+  /* 「锁定」：清掉本机解锁标记，退回密码门（这次会话也不再免密） */
+  function lockToGate() {
+    setRemembered(false);
+    close();
+    openGate("已锁定：本机的「记住本机」标记已清除，请重新输入密码。");
+    return true;
   }
   function close() {
-    if (!adminOpen) return;
+    if (!adminOpen && !gateOpen) return;
     adminOpen = false;
+    gateOpen = false;
+    if (cdTimer) { clearTimeout(cdTimer); cdTimer = null; }
     if (overlayEl && overlayEl.parentNode) overlayEl.parentNode.removeChild(overlayEl);
     overlayEl = null;
     refs = {};
@@ -1608,13 +2091,118 @@ renderHall();
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", maybeOpenByUrl);
   }
+  /* Esc：密码门和面板都能一键关掉 */
+  document.addEventListener("keydown", function (e) {
+    if ((adminOpen || gateOpen) && (e.key === "Escape" || e.keyCode === 27)) close();
+  });
+
+  /* 需求 2 的脚本入口：改某一条的显示开关（走真实勾选框，触发实时联动） */
+  function setGameOn(i, on) {
+    if (refs.list && refs.list.children[i]) {
+      var cb = refs.list.children[i].querySelector("input.ha-onbox");
+      if (!cb) return false;
+      cb.checked = !!on;
+      cb.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+    if (!GAMES[i]) return false;
+    GAMES[i].on = !!on;
+    renderHall();
+    return true;
+  }
 
   /* ---------- 暴露给自动化测试（不影响普通访客） ---------- */
   window.__HALL_ADMIN__ = {
-    version: 1,
+    version: 2,
     isOpen: function () { return adminOpen; },
     open: function () { open(); return adminOpen; },
     close: function () { close(); return adminOpen; },
+    /* 密码门（需求 1） */
+    gate: {
+      visible: function () { return gateOpen; },
+      node: function () { return !!document.getElementById("haGatePw"); },
+      msg: function () { return refs.gateMsg ? refs.gateMsg.textContent : ""; },
+      msgShown: function () { return !!(refs.gateMsg && /(^|\s)show(\s|$)/.test(refs.gateMsg.className)); },
+      pwValue: function () { return refs.gatePw ? refs.gatePw.value : null; },
+      pwType: function () { return refs.gatePw ? refs.gatePw.type : null; },
+      pwDisabled: function () { return !!(refs.gatePw && refs.gatePw.disabled); },
+      btnText: function () { return refs.gateBtn ? refs.gateBtn.textContent : ""; },
+      btnDisabled: function () { return !!(refs.gateBtn && refs.gateBtn.disabled); },
+      setPassword: function (v) { if (!refs.gatePw) return false; refs.gatePw.value = String(v == null ? "" : v); return true; },
+      remember: function (on) {
+        if (!refs.gateRemember) return false;
+        refs.gateRemember.checked = !!on;
+        return refs.gateRemember.checked;
+      },
+      rememberChecked: function () { return !!(refs.gateRemember && refs.gateRemember.checked); },
+      rememberDisabled: function () { return !!(refs.gateRemember && refs.gateRemember.disabled); },
+      submit: function () { return submitGate(); },
+      cooldownLeft: function () { return cdLeft(); },
+      triesLeft: function () { return triesLeft; },
+      /* 点了提交按钮（真实 DOM 路径），不是直接调函数 */
+      click: function () {
+        var b = document.getElementById("haGateGo");
+        if (!b) return false;
+        b.click();
+        return true;
+      }
+    },
+    /* 解锁：填密码 + 提交，走的还是密码门那条真实路径 */
+    unlock: function (pw, remember) {
+      if (!gateOpen) openGate("");
+      if (!refs.gatePw) return false;
+      if (remember != null && refs.gateRemember) refs.gateRemember.checked = !!remember;
+      refs.gatePw.value = String(pw == null ? "" : pw);
+      return submitGate();
+    },
+    lock: function () { return lockToGate(); },
+    remembered: function () { return isRemembered(); },
+    hashPassword: function (pw, salt) { return hallPassHash(pw, salt == null ? ADMIN_SALT : salt); },
+    constants: function () { return { salt: ADMIN_SALT, hash: ADMIN_PASS_HASH }; },
+    /* 需求 2：游戏开关 */
+    onFlags: function () {
+      return GAMES.map(function (g) { return g.on !== false; });
+    },
+    onBoxCount: function () { return document.querySelectorAll("#haList input.ha-onbox").length; },
+    onBoxState: function (i) {
+      var cb = refs.list && refs.list.children[i] && refs.list.children[i].querySelector("input.ha-onbox");
+      return cb ? cb.checked : null;
+    },
+    setGameOn: function (i, on) { return setGameOn(i, on); },
+    clickOnBox: function (i) {
+      var cb = refs.list && refs.list.children[i] && refs.list.children[i].querySelector("input.ha-onbox");
+      if (!cb) return false;
+      cb.click();
+      return true;
+    },
+    setAllOn: function (on) { return setAllOn(on); },
+    /* 需求 3：改密码 */
+    security: {
+      plan: function (pw, pw2, rotate) { return planPassword(pw, pw2, rotate); },
+      apply: function (pw, pw2, rotate) { return applyPassword(pw, pw2, rotate); },
+      now: function () { return refs.secNow ? refs.secNow.textContent : ""; },
+      msg: function () { return refs.secMsg ? refs.secMsg.textContent : ""; },
+      setValues: function (a, b, rotate) {
+        if (!refs.sec1) return false;
+        refs.sec1.value = String(a == null ? "" : a);
+        refs.sec2.value = String(b == null ? "" : b);
+        if (rotate != null && refs.secRotate) refs.secRotate.checked = !!rotate;
+        return true;
+      },
+      clickApply: function () {
+        var b = document.getElementById("haSecApply");
+        if (!b) return false;
+        b.click();
+        return true;
+      },
+      clickPlan: function () {
+        var b = document.getElementById("haSecPlan");
+        if (!b) return false;
+        b.click();
+        return true;
+      }
+    },
+    readVar: function (html, name) { return readVarLiteral(html, name); },
     games: function () { return clone(GAMES); },
     settings: function () { return { title: HALL_TITLE, sub: HALL_SUB, dedication: HALL_DEDICATION }; },
     add: function () { var b = document.getElementById("haAdd"); if (b) { b.click(); return true; } return false; },
@@ -1665,11 +2253,20 @@ renderHall();
     },
     validate: function () { return validateGames(collectGames()); },
     /* 产物守卫的直连入口（只给自动化测试用）：传入任意源码，看它会不会被拒绝 */
-    buildModified: function (src, games, title, sub, dedication) {
-      try { return buildModifiedHtml(src, games || collectGames(), title, sub, dedication); }
+    buildModified: function (src, games, title, sub, dedication, sec) {
+      try { return buildModifiedHtml(src, games || collectGames(), title, sub, dedication, sec); }
       catch (e) { return { ok: false, error: "抛异常：" + (e && e.message ? e.message : e) }; }
     },
-    verifyOutput: function (html) { return verifyOutput(html, collectGames()); },
+    verifyOutput: function (html, sec) { return verifyOutput(html, collectGames(), sec || null); },
+    /* 只走字符串生成，不点「下载」按钮（无头 Chrome 点下载会挂住） */
+    buildString: function () { return buildForSave(); },
+    /* 改了密码之后、不想发布时，直接拿产物字符串 */
+    buildWith: function (games, title, sub, dedication, sec) {
+      var r = buildModifiedHtml(cleanSource(), games || collectGames(), title, sub, dedication, sec || null);
+      if (!r.ok) return r;
+      var bad = verifyOutput(r.html, games || collectGames(), sec || null);
+      return bad ? { ok: false, error: bad } : r;
+    },
     publish: function (token) {
       var html = buildForSave();
       if (!html) return Promise.resolve({ ok: false, error: "生成失败" });
