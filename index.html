@@ -77,6 +77,7 @@
     max-width: 660px; margin: 44px auto 0; padding-top: 20px;
     border-top: 1px solid #ecdedb; color: #9b8486;
     font-size: 12.5px; line-height: 2.1; letter-spacing: .02em;
+    white-space: pre-line; /* 纪念文字由 JS 注入：保留换行，等价于原来的 <br> */
   }
   code { background: #f1e6e3; border-radius: 5px; padding: 1px 5px; font-size: 12px; }
 </style>
@@ -90,7 +91,7 @@
   <div class="grid" id="grid"></div>
   <!-- 开发备忘：加新游戏 → 编辑本文件顶部 GAMES 数组（标题/简介/链接/封面）；
        小游戏各自独立仓库，开好 GitHub Pages 后把链接填进来。详见 README.md -->
-  <footer class="dedication">
+  <footer class="dedication" id="dedication">
     谨以此，纪念那些被我们笑过、也被我们记住的大学时光。<br>
     教学楼的风、操场边的玩笑、深夜宿舍里没头没尾的废话，都被收进了这个小小的游戏里。<br>
     合到最后，屏幕会亮起一片金色——就像那几年，谁也没觉得有什么特别，回头看却一直在发光。
@@ -106,6 +107,8 @@
    tag   : 右上角小标签（可留空） */
 var HALL_TITLE = "游戏大厅";
 var HALL_SUB = "点开即玩 · 手机电脑都支持";
+var HALL_DEDICATION = "谨以此，纪念那些被我们笑过、也被我们记住的大学时光。\n教学楼的风、操场边的玩笑、深夜宿舍里没头没尾的废话，都被收进了这个小小的游戏里。\n合到最后，屏幕会亮起一片金色——就像那几年，谁也没觉得有什么特别，回头看却一直在发光。";
+/* @@HALL-ADMIN-GAMES-START-v1@@ */
 var GAMES = [
   {
     title: "合成杨璐恺",
@@ -145,15 +148,20 @@ var GAMES = [
   }
   */
 ];
+/* @@HALL-ADMIN-GAMES-END-v1@@ */
 
 document.title = HALL_TITLE;
 document.getElementById("hallTitle").textContent = HALL_TITLE;
 document.getElementById("hallSub").textContent = HALL_SUB;
+var hallDedicationEl = document.getElementById("dedication");
+if (hallDedicationEl) hallDedicationEl.textContent = HALL_DEDICATION;
 
-(function render() {
+function renderHall() {
   var grid = document.getElementById("grid");
+  grid.innerHTML = "";
   if (!GAMES.length) {
     grid.innerHTML = '<div class="empty">还没有游戏，先在 GAMES 里加一条吧</div>';
+    if (typeof updateDiagMeta === "function") updateDiagMeta();
     return;
   }
   var frag = document.createDocumentFragment();
@@ -192,6 +200,1553 @@ document.getElementById("hallSub").textContent = HALL_SUB;
     frag.appendChild(a);
   });
   grid.appendChild(frag);
+  if (typeof updateDiagMeta === "function") updateDiagMeta();
+}
+renderHall();
+
+/* =====================================================================
+   以下为「隐藏管理员面板」：默认不渲染任何 DOM、不注入样式。
+   触发方式：?admin=1 / #admin，或在 2 秒内连续点击页面标题 5 次。
+   ===================================================================== */
+/* 管理员面板 */
+(function () {
+  "use strict";
+
+  /* ---------- 常量与全局（只在触发后才被用到） ---------- */
+  var ACCESS_KEY = "admin";
+  var TOKEN_KEY = "hall-admin:token:v1";
+  var REPO = { owner: "merge-games", repo: "hall", path: "index.html", branch: "main", file: "index.html" };
+  /* 源码编辑器：可读写的仓库，以及每个仓库预置的常用文件入口 */
+  var REPOS = ["hall", "merge-yanglukai", "jump-yanglukai", "fruit-yanglukai", "galgame-yanglukai", "game-kit"];
+  var FILE_PRESETS = {
+    hall: ["index.html", "README.md", ".nojekyll"],
+    "merge-yanglukai": ["index.html", "README.md"],
+    "jump-yanglukai": ["index.html", "README.md"],
+    "fruit-yanglukai": ["index.html", "README.md"],
+    "galgame-yanglukai": ["index.html", "README.md"],
+    "game-kit": ["index.html", "README.md", ".nojekyll"]
+  };
+  /* 标记在文件里必须全局唯一（生成文件时会重新插入同样的注释），
+     所以字面量在此处拆开拼接，避免源码里出现第二份完整标记。 */
+  var MARK_A = "/* @@HALL" + "-ADMIN-GAMES-START-v1@@ */";
+  var MARK_B = "/* @@HALL" + "-ADMIN-GAMES-END-v1@@ */";
+  /* 产物自检用的「面板节点」特征串。同样拆开拼接：否则本脚本自己就会把这段字面量
+     写进产物，导致自检永远命中。 */
+  var NEEDLE_PANEL = '<div id="hall' + 'AdminRoot"';
+  var NEEDLE_STYLE = '<style id="hall' + 'AdminStyle"';
+  var STATS_KEYS = {
+    mergeBest: "merge-yanglukai:best:v2",
+    mergeCodex: "merge-yanglukai:codex:v1",
+    jumpBest: "jump-yanglukai:best:v1",
+    jumpChai: "jump-yanglukai:chai:v1",
+    fruitBest: "fruit-yanglukai:best:v1",
+    fruitProgress: "fruit-yanglukai:progress:v1",
+    galEnds: "galgame-yanglukai:ends:v1",
+    galSave: "galgame-yanglukai:save:v1"
+  };
+
+  var adminOpen = false;      // 面板是否已构建
+  var overlayEl = null;       // 覆盖层
+  var refs = {};              // 常用节点缓存
+  var snap = null;            // 本次打开时的原始配置快照
+  var buildForSaveError = ""; // 上次 buildForSave 失败原因（用于自检显式暴露）
+
+  var errCount = 0;           // 运行时错误计数（面板「自检」可见）
+  var errLast = "";
+  window.addEventListener("error", function (e) {
+    errCount++;
+    errLast = (e && e.message) ? e.message : String(e);
+    paintErr();
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    errCount++;
+    errLast = "unhandledrejection: " + ((e && e.reason && e.reason.message) ? e.reason.message : String(e && e.reason));
+    paintErr();
+  });
+
+  /* ---------- 小工具 ---------- */
+  function el(tag, cls, text) {
+    var d = document.createElement(tag);
+    if (cls) d.className = cls;
+    if (text != null) d.textContent = text;
+    return d;
+  }
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function nowText() {
+    var d = new Date();
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
+      " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+  function toast(msg, kind) {
+    if (!overlayEl) return;
+    var t = refs.toast;
+    t.textContent = msg;
+    t.className = "ha-toast show" + (kind ? " " + kind : "");
+    if (refs._toastTimer) clearTimeout(refs._toastTimer);
+    refs._toastTimer = setTimeout(function () { t.className = "ha-toast"; }, 4200);
+  }
+  function download(name, text) {
+    var blob = new Blob([text], { type: "text/html;charset=utf-8" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  }
+
+  /* ---------- 解析源码里的 GAMES 数组范围 ----------
+     用一个支持字符串/注释的扫描器找 "var GAMES" 后面那个数组的 [ ... ]，
+     不依赖任何会被本脚本自身重复出现的字面量，重复生成也不会互相干扰。 */
+  function skipString(src, i) {
+    var q = src.charAt(i);
+    i++;
+    while (i < src.length) {
+      var c = src.charAt(i);
+      if (c === "\\") { i += 2; continue; }
+      if (c === q) return i + 1;
+      if (q !== "`" && (c === "\n" || c === "\r")) return i; /* 未闭合，避免死循环 */
+      i++;
+    }
+    return i;
+  }
+  function skipLineComment(src, i) {
+    var n = src.indexOf("\n", i);
+    return n < 0 ? src.length : n;
+  }
+  function skipBlockComment(src, i) {
+    var n = src.indexOf("*/", i);
+    return n < 0 ? src.length : n + 2;
+  }
+  function matchBracket(src, open) {
+    var depth = 0;
+    for (var i = open; i < src.length; i++) {
+      var c = src.charAt(i);
+      if (c === '"' || c === "'" || c === "`") { i = skipString(src, i) - 1; continue; }
+      if (c === "/" && src.charAt(i + 1) === "/") { i = skipLineComment(src, i + 2) - 1; continue; }
+      if (c === "/" && src.charAt(i + 1) === "*") { i = skipBlockComment(src, i + 2) - 1; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+  }
+  /* 返回 var GAMES 这条声明的位置：
+     start = "var GAMES" 起始处（替换从这里开始）
+     open  = 数组 "[" 的下标；close = 配对 "]" 的下标（替换到 close 为止）
+     注意：替换 [start, close] 而保留原来的分号，避免生成 "];" 与 ";" 打架。 */
+  function findGamesRange(src) {
+    var start = src.indexOf("var GAMES");
+    if (start < 0) return null;
+    var closeTag = "<" + "/script";
+    var scriptEnd = src.indexOf(closeTag, start);
+    if (scriptEnd < 0) scriptEnd = src.length;
+    var open = src.indexOf("[", start);
+    if (open < 0 || open > scriptEnd) return null;
+    var close = matchBracket(src, open);
+    if (close < 0 || close > scriptEnd) return null;
+    return { start: start, open: open, close: close };
+  }
+
+  /* ---------- 把面板状态写回文件：只替换 GAMES 声明 + 三个配置变量赋值 ---------- */
+  function buildModifiedHtml(src, games, title, sub, dedication) {
+    var range = findGamesRange(src);
+    if (!range) return { ok: false, error: "没找到 GAMES 代码块，请确认当前文件是原始的 index.html" };
+    var head = src.slice(0, range.start);        // 到 "var GAMES" 之前
+    var tail = src.slice(range.close + 1);       // 从原数组 "]" 之后（通常是 ";"）开始
+    var ca = head.split(MARK_A).length - 1;
+    var cb = tail.split(MARK_B).length - 1;
+    if (ca !== 1 || cb !== 1) {
+      return { ok: false, error: "文件的写入标记异常（" + ca + "/" + cb + "），为避免写坏页面已中止" };
+    }
+    var decl = "var GAMES = " + gamesArrayCode(games);
+    if (!/^\s*;/.test(tail)) decl += ";";        // 原文件没有分号时补一个
+    var out = head + decl + tail;
+    out = replaceVar(out, "HALL_TITLE", title);
+    out = replaceVar(out, "HALL_SUB", sub);
+    out = replaceVar(out, "HALL_DEDICATION", dedication);
+    return { ok: true, html: out };
+  }
+  /* 替换形如 var NAME = <表达式>; 的赋值（只替换第一处）。
+     用扫描器找字符串字面量的结尾，避免值里出现分号（如中文简介里的 ";"）时被截断。 */
+  function replaceVar(src, name, value) {
+    var key = "var " + name;
+    var at = src.indexOf(key);
+    if (at < 0) return src;
+    var eq = src.indexOf("=", at + key.length);
+    if (eq < 0) return src;
+    var v = eq + 1;
+    while (v < src.length && /\s/.test(src.charAt(v))) v++;
+    var c = src.charAt(v);
+    var end;
+    if (c === '"' || c === "'" || c === "`") end = skipString(src, v);
+    else {
+      var semi = src.indexOf(";", v);
+      end = semi < 0 ? src.length : semi;
+    }
+    return src.slice(0, eq + 1) + " " + jsStr(value) + src.slice(end);
+  }
+
+  /* ---------- 序列化 ---------- */
+  function jsStr(s) {
+    return '"' + String(s == null ? "" : s)
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\r/g, "\\r")
+      .replace(/\n/g, "\\n")
+      .replace(/\u2028/g, "\\u2028")
+      .replace(/\u2029/g, "\\u2029") + '"';
+  }
+  /* 只产出数组字面量 "[ … ]"；写回文件时沿用原文件里的那个分号 */
+  function gamesArrayCode(list) {
+    var b = "[";
+    for (var i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (i) b += ",";
+      b += "\n  {\n" +
+        "    title: " + jsStr(g.title) + ",\n" +
+        "    desc: " + jsStr(g.desc || "") + ",\n" +
+        "    url: " + jsStr(g.url) + ",\n" +
+        "    cover: " + jsStr(g.cover || "") + ",\n" +
+        "    tag: " + jsStr(g.tag || "") + "\n" +
+        "  }";
+    }
+    return b + "\n]";
+  }
+  /* 完整一条声明，供「复制 GAMES 代码」粘贴回文件 */
+  function gamesCode(list) {
+    return "var GAMES = " + gamesArrayCode(list) + ";";
+  }
+
+  /* ---------- 校验 ---------- */
+  function validateGames(list) {
+    var errs = [];
+    if (!list.length) errs.push("至少要有一个游戏");
+    list.forEach(function (g, i) {
+      var no = "第 " + (i + 1) + " 条";
+      if (!String(g.title || "").trim()) errs.push(no + "：标题不能为空");
+      var u = String(g.url || "").trim();
+      if (!u) errs.push(no + "：链接不能为空");
+      else if (!/^(https?:|\/|\.{1,2}\/|[A-Za-z0-9_\-.]+\/)/.test(u)) {
+        errs.push(no + "：链接需以 http / https / / 或相对路径开头");
+      }
+    });
+    return errs;
+  }
+
+  /* ---------- 面板构建（懒加载，触发时才创建 DOM 与样式） ---------- */
+  function injectStyle() {
+    if (document.getElementById("hallAdminStyle")) return;
+    var css = [
+      "#hallAdminRoot{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:flex-start;justify-content:center;",
+      "background:rgba(58,33,35,.45);padding:18px;overflow:auto;}",
+      "#hallAdminRoot .ha-panel{width:min(920px,100%);background:#f6efec;border-radius:18px;border:1px solid #ecdedb;",
+      "box-shadow:0 18px 48px rgba(58,33,35,.28);padding:16px 16px 20px;color:#3a2123;font-size:13px;}",
+      "#hallAdminRoot h2{margin:0;font-size:17px;color:#9a2130;letter-spacing:.04em;}",
+      "#hallAdminRoot h3{margin:16px 0 8px;font-size:13.5px;color:#9a2130;letter-spacing:.04em;}",
+      "#hallAdminRoot .ha-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-bottom:1px solid #ecdedb;padding-bottom:12px;}",
+      "#hallAdminRoot .ha-badge{background:#9a2130;color:#fff;border-radius:999px;padding:2px 10px;font-size:11px;letter-spacing:.08em;}",
+      "#hallAdminRoot .ha-spacer{flex:1;}",
+      "#hallAdminRoot .ha-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}",
+      "#hallAdminRoot button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid #ddc9c5;background:#fff;color:#3a2123;padding:6px 11px;}",
+      "#hallAdminRoot button:hover{background:#fdf3f1;border-color:#c9a9a4;}",
+      "#hallAdminRoot button:disabled{opacity:.5;cursor:not-allowed;}",
+      "#hallAdminRoot button.ha-primary{background:#9a2130;border-color:#9a2130;color:#fff;font-weight:700;}",
+      "#hallAdminRoot button.ha-primary:hover{background:#87202a;}",
+      "#hallAdminRoot button.ha-danger{color:#9a2130;border-color:#e3bdb8;}",
+      "#hallAdminRoot input[type=text],#hallAdminRoot input[type=password],#hallAdminRoot textarea{font:inherit;color:#3a2123;background:#fff;",
+      "border:1px solid #ddc9c5;border-radius:9px;padding:5px 8px;width:100%;}",
+      "#hallAdminRoot select{font:inherit;color:#3a2123;background:#fff;border:1px solid #ddc9c5;border-radius:9px;padding:5px 8px;}",
+      "#hallAdminRoot textarea.ha-src{width:100%;min-height:210px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;line-height:1.6;",
+      "white-space:pre;margin-top:6px;}",
+      "#hallAdminRoot input:focus,#hallAdminRoot textarea:focus{outline:2px solid rgba(154,33,48,.28);outline-offset:1px;}",
+      "#hallAdminRoot textarea{resize:vertical;line-height:1.7;}",
+      "#hallAdminRoot label.ha-lab{display:block;color:#8a7376;font-size:11.5px;margin-bottom:3px;letter-spacing:.04em;}",
+      "#hallAdminRoot .ha-list{display:grid;gap:10px;}",
+      "#hallAdminRoot .ha-item{background:#fff;border:1px solid #f0e2df;border-radius:14px;padding:10px 12px;box-shadow:0 2px 8px rgba(58,33,35,.05);}",
+      "#hallAdminRoot .ha-item .ha-itemhead{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;}",
+      "#hallAdminRoot .ha-no{font-weight:800;color:#9a2130;font-size:12px;}",
+      "#hallAdminRoot .ha-grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;}",
+      "#hallAdminRoot .ha-grid5{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;}",
+      "#hallAdminRoot .ha-err{color:#9a2130;background:#fbe9e7;border:1px solid #f0c9c3;border-radius:10px;padding:7px 10px;margin-top:8px;line-height:1.7;display:none;}",
+      "#hallAdminRoot .ha-err.show{display:block;}",
+      "#hallAdminRoot .ha-note{color:#8a7376;font-size:11.5px;line-height:1.85;}",
+      "#hallAdminRoot .ha-warn{background:#fdf0e6;border:1px solid #f0d3b3;color:#8a5a1f;border-radius:10px;padding:8px 10px;line-height:1.8;}",
+      "#hallAdminRoot table.ha-table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;font-size:12.5px;}",
+      "#hallAdminRoot table.ha-table th,#hallAdminRoot table.ha-table td{border-bottom:1px solid #f2e6e3;padding:6px 9px;text-align:left;vertical-align:top;}",
+      "#hallAdminRoot table.ha-table th{background:#fbf3f1;color:#8a7376;font-weight:700;font-size:11.5px;letter-spacing:.04em;}",
+      "#hallAdminRoot .ha-kv{color:#8a7376;font-size:11px;word-break:break-all;}",
+      "#hallAdminRoot .ha-out{width:100%;height:98px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;white-space:pre;margin-top:8px;display:none;}",
+      "#hallAdminRoot .ha-out.show{display:block;}",
+      "#hallAdminRoot .ha-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#3a2123;color:#fff;",
+      "padding:9px 16px;border-radius:999px;font-size:12.5px;opacity:0;pointer-events:none;transition:opacity .2s ease;max-width:88vw;text-align:center;z-index:2147483001;}",
+      "#hallAdminRoot .ha-toast.show{opacity:1;}",
+      "#hallAdminRoot .ha-toast.err{background:#9a2130;}",
+      "#hallAdminRoot a{color:#9a2130;word-break:break-all;}",
+      "@media(max-width:430px){#hallAdminRoot .ha-grid2,#hallAdminRoot .ha-grid5{grid-template-columns:1fr;}}"
+    ].join("");
+    var s = document.createElement("style");
+    s.id = "hallAdminStyle";
+    s.textContent = css;
+    document.head.appendChild(s);
+  }
+
+  function field(labelText, value, placeholder) {
+    var w = el("div");
+    w.appendChild(el("label", "ha-lab", labelText));
+    var i = el("input", null, null);
+    i.type = "text";
+    i.value = value == null ? "" : value;
+    if (placeholder) i.placeholder = placeholder;
+    w.appendChild(i);
+    w._input = i;
+    return w;
+  }
+
+  function buildItem(g, i) {
+    var box = el("div", "ha-item");
+    box._index = i;
+    var head = el("div", "ha-itemhead");
+    head.appendChild(el("span", "ha-no", "#" + (i + 1)));
+    head.appendChild(el("span", "ha-lab", g.title || "(未命名)"));
+    head.appendChild(el("span", "ha-spacer"));
+    var up = el("button", null, "↑ 上移");
+    var dn = el("button", null, "↓ 下移");
+    var del = el("button", "ha-danger", "删除");
+    up._act = "up"; dn._act = "down"; del._act = "del";
+    head.appendChild(up); head.appendChild(dn); head.appendChild(del);
+    box.appendChild(head);
+
+    var g2 = el("div", "ha-grid2");
+    g2.appendChild(field("标题", g.title, "游戏名"));
+    g2.appendChild(field("链接", g.url, "https:// 或 相对路径"));
+    box.appendChild(g2);
+
+    var descW = field("简介", g.desc, "一句话简介");
+    descW.style.marginTop = "8px";
+    box.appendChild(descW);
+
+    var g5 = el("div", "ha-grid5");
+    g5.appendChild(field("封面图", g.cover, "可留空"));
+    g5.appendChild(field("标签", g.tag, "可留空"));
+    box.appendChild(g5);
+
+    var inputs = box.querySelectorAll("input");
+    box._title = inputs[0];
+    box._url = inputs[1];
+    box._desc = inputs[2];
+    box._cover = inputs[3];
+    box._tag = inputs[4];
+    /* 输入即重渲染大厅卡片（所见即所得）；非法时红字提示、不回写 */
+    function onInput() {
+      var list = collectGames();
+      var errs = validateGames(list);
+      showErrors(errs);
+      if (errs.length) return;
+      GAMES = list;
+      renderHall();
+    }
+    [box._title, box._desc, box._url, box._cover, box._tag].forEach(function (inp) {
+      inp.addEventListener("input", onInput);
+    });
+    return box;
+  }
+
+  function collectGames() {
+    var out = [];
+    if (!refs.list) return out;
+    var items = refs.list.querySelectorAll(".ha-item");
+    for (var i = 0; i < items.length; i++) {
+      var b = items[i];
+      out.push({
+        title: b._title.value.trim(),
+        desc: b._desc.value,
+        url: b._url.value.trim(),
+        cover: b._cover.value.trim(),
+        tag: b._tag.value.trim()
+      });
+    }
+    return out;
+  }
+
+  function showErrors(errs) {
+    if (!refs.err) return;
+    if (!errs.length) {
+      refs.err.className = "ha-err";
+      refs.err.textContent = "";
+      return;
+    }
+    refs.err.className = "ha-err show";
+    refs.err.textContent = "⚠ 未写入：" + errs.join("；");
+  }
+
+  function fillList(selectIndex) {
+    var games = snap.games.map(function (g) {
+      return { title: g.title, desc: g.desc, url: g.url, cover: g.cover, tag: g.tag };
+    });
+    refs.list.innerHTML = "";
+    games.forEach(function (g, i) { refs.list.appendChild(buildItem(g, i)); });
+    GAMES = collectGames();
+    renderHall();
+    if (typeof selectIndex === "number" && refs.list.children[selectIndex]) {
+      refs.list.children[selectIndex].scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function snapshotNow() {
+    return {
+      games: collectGames(),
+      title: refs.t1.value,
+      sub: refs.t2.value,
+      dedication: refs.t3.value
+    };
+  }
+
+  /* ---------- 保存 1：复制 GAMES 代码 ---------- */
+  function doCopy() {
+    var errs = validateGames(collectGames());
+    showErrors(errs);
+    if (errs.length) { toast("存在问题，未生成代码", "err"); return false; }
+    var code = gamesCode(collectGames());
+    showOut(code);
+    copyText(code).then(function () {
+      toast("已复制 GAMES 代码（" + collectGames().length + " 条），贴回文件即可");
+    }).catch(function () {
+      toast("复制失败，代码已显示在下方，请手动复制", "err");
+    });
+    return code;
+  }
+  function showOut(code) {
+    refs.out.value = code;
+    refs.out.className = "ha-out show";
+  }
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error("execCommand copy failed"));
+      } catch (e) { reject(e); }
+    });
+  }
+
+  /* ---------- 保存 2：下载整页 ---------- */
+  /* 从当前 DOM 还原一份「干净」的整页源码：
+     - 去掉面板注入的节点（#hallAdminRoot / #hallAdminStyle）与诊断属性
+     - 清空运行时渲染出来的卡片，避免把渲染结果写死进文件
+     - 补回 doctype（documentElement.outerHTML 不含 doctype，缺了会进怪异模式） */
+  function cleanSource() {
+    var root = document.documentElement.cloneNode(true);
+    var doomed = root.querySelectorAll("#hallAdminRoot,#hallAdminStyle");
+    for (var i = 0; i < doomed.length; i++) {
+      if (doomed[i].parentNode) doomed[i].parentNode.removeChild(doomed[i]);
+    }
+    var b = root.querySelector("body");
+    if (b) b.removeAttribute("data-ha-dump");
+    var g = root.querySelector("#grid");
+    if (g) g.innerHTML = "";
+    return "<!DOCTYPE html>\n" + root.outerHTML;
+  }
+  /* 产物自检：宁可不让下载/发布，也不能把页面写坏 */
+  function verifyOutput(html, games) {
+    if (html.slice(0, 20).indexOf("<!DOCTYPE") !== 0) return "产物缺少 <!DOCTYPE html>";
+    var r = findGamesRange(html);
+    if (!r) return "产物里找不到 GAMES 声明";
+    if (html.slice(r.open, r.close + 1) !== gamesArrayCode(games)) return "产物里的 GAMES 数组和预期不一致";
+    if (games.length && html.slice(r.open, r.close + 1).split("\n  {").length - 1 !== games.length) {
+      return "产物条目数不对";
+    }
+    if (html.split(MARK_A).length - 1 !== 1 || html.split(MARK_B).length - 1 !== 1) return "产物写入标记数量不对";
+    if (html.indexOf(NEEDLE_PANEL) >= 0 || html.indexOf(NEEDLE_STYLE) >= 0) {
+      return "产物里混进了管理面板节点";
+    }
+    return "";
+  }
+  function buildForSave() {
+    buildForSaveError = "";
+    var errs = validateGames(collectGames());
+    showErrors(errs);
+    if (errs.length) { buildForSaveError = "校验未通过"; toast("存在问题，未保存", "err"); return null; }
+    var st = snapshotNow();
+    var r = buildModifiedHtml(cleanSource(), st.games, st.title, st.sub, st.dedication);
+    if (!r.ok) { buildForSaveError = r.error; toast("生成失败：" + r.error, "err"); return null; }
+    var bad = verifyOutput(r.html, st.games);
+    if (bad) { buildForSaveError = bad; toast("产物自检失败：" + bad, "err"); return null; }
+    return r.html;
+  }
+  function doDownload() {
+    var html = buildForSave();
+    if (!html) return;
+    download(REPO.file, html);
+    toast("已下载 " + REPO.file + "，替换仓库里的同名文件即可");
+  }
+
+  /* ---------- 保存 3：用 GitHub Token 发布 ---------- */
+  function b64Utf8(str) {
+    var bytes = new TextEncoder().encode(str);
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+  function utf8B64(b64) {
+    var bin = atob(String(b64).replace(/\s+/g, ""));
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (typeof TextDecoder === "undefined") {
+      /* 老浏览器兜底：只处理 BMP */
+      var out = "";
+      for (var k = 0; k < bytes.length; k++) out += String.fromCharCode(bytes[k]);
+      return decodeURIComponent(escape(out));
+    }
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+  /* 路径按段转义：中文件名/空格都能用 */
+  function encodePath(p) {
+    return String(p).split("/").map(encodeURIComponent).join("/");
+  }
+  function apiUrl(repo, path, query) {
+    return "https://api.github.com/repos/" + REPO.owner + "/" + repo + "/contents/" + encodePath(path) + (query || "");
+  }
+  function headers(token) {
+    return {
+      "Authorization": "Bearer " + token,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    };
+  }
+  function apiMessage(status, body, repo, path) {
+    var msg = (body && (body.message || (body.error && body.error.message))) || "";
+    var full = REPO.owner + "/" + (repo || REPO.repo);
+    if (status === 401) return "401：Token 无效或已过期，请重新生成（需 repo / Contents: Read and write）";
+    if (status === 403) return "403：Token 无权限或触发了限流" + (msg ? "（" + msg + "）" : "") + "，请确认该 Token 对 " + full + " 有 Contents 写权限";
+    if (status === 404) return "404：仓库或路径不对，或 Token 看不到 " + full + (path ? " 的 " + path : "") + "（私有时需授予仓库访问）";
+    if (status === 409) return "409：分支状态冲突（sha 过期），会自动重新拉取最新 sha 再试一次";
+    if (status === 422) return "422：提交被拒绝" + (msg ? "（" + msg + "）" : "");
+    return "HTTP " + status + "：" + (msg || "请求失败");
+  }
+  /* GET 单个文件；文件不存在返回 null（用于新建），其它错误直接抛 */
+  function getFile(repo, path, token) {
+    var url = apiUrl(repo, path, "?ref=" + encodeURIComponent(REPO.branch));
+    return fetch(url, { headers: headers(token), cache: "no-store" }).then(function (res) {
+      if (res.status === 404) return null;
+      if (!res.ok) {
+        return res.text().then(function () {
+          var e = new Error(apiMessage(res.status, null, repo, path));
+          e.status = res.status;
+          throw e;
+        });
+      }
+      return res.json();
+    });
+  }
+  /* 拉取当前文件的 sha（大厅发布用；文件必须存在） */
+  function fetchSha(token) {
+    return getFile(REPO.repo, REPO.path, token).then(function (data) {
+      if (!data) throw new Error(apiMessage(404, null, REPO.repo, REPO.path));
+      if (!data.sha) throw new Error("响应里没有 sha，可能不是文件路径");
+      return data.sha;
+    });
+  }
+  /* 覆盖提交；冲突（409/422）时自动重拉一次 sha 再试一次 */
+  function putContent(repo, path, token, content, sha, message) {
+    var payload = { message: message, content: b64Utf8(content), branch: REPO.branch };
+    if (sha) payload.sha = sha;              /* 新建文件时不传 sha */
+    return fetch(apiUrl(repo, path), {
+      method: "PUT", headers: headers(token), body: JSON.stringify(payload)
+    }).then(function (res) {
+      if (!res.ok) return res.json().catch(function () { return null; }).then(function (j) {
+        var e = new Error(apiMessage(res.status, j, repo, path));
+        e.status = res.status;
+        throw e;
+      });
+      return res.json();
+    });
+  }
+  /* 通用「读 sha → 写」流程，带一次 409/422 冲突重试 */
+  function commitFile(repo, path, token, content, sha, message) {
+    return putContent(repo, path, token, content, sha, message).catch(function (e) {
+      if (e.status !== 409 && e.status !== 422) throw e;
+      return getFile(repo, path, token).then(function (meta) {
+        return putContent(repo, path, token, content, meta && meta.sha, message);
+      });
+    }).then(function (data) {
+      return {
+        commit: (data && data.commit && data.commit.html_url) || "",
+        sha: data && data.content && data.content.sha,
+        status: "ok"
+      };
+    });
+  }
+  function publish(token, content, message) {
+    if (!token) return Promise.reject(new Error("请先填写 GitHub Token"));
+    if (!content) return Promise.reject(new Error("没有可发布的内容"));
+    return fetchSha(token).then(function (sha) {
+      return commitFile(REPO.repo, REPO.path, token, content, sha, message);
+    });
+  }
+  function doPublish() {
+    var html = buildForSave();
+    if (!html) return;
+    var token = refs.token.value.trim();
+    if (!token) { paintPublish(null, "请先填写 GitHub Token", true); return; }
+    saveToken(token, refs.remember.checked);
+    refs.publishBtn.disabled = true;
+    paintPublish(null, "正在拉取 sha → 提交…", false);
+    var message = "更新大厅（管理员面板 " + nowText() + "）";
+    var t0 = Date.now();
+    publish(token, html, message).then(function (r) {
+      refs.publishBtn.disabled = false;
+      var txt = "✅ 发布成功（" + ((Date.now() - t0) / 1000).toFixed(1) + "s）。Pages 约 1 分钟内生效。";
+      paintPublish(r, txt, false);
+    }).catch(function (e) {
+      refs.publishBtn.disabled = false;
+      paintPublish(null, "❌ 发布失败：" + (e && e.message ? e.message : e), true);
+    });
+  }
+  function paintPublish(result, text, isError) {
+    if (typeof text === "string" && text) {
+      refs.pubMsg.className = "ha-err" + (isError ? " show" : " show");
+      refs.pubMsg.style.color = isError ? "#9a2130" : "#2f6b3b";
+      refs.pubMsg.style.background = isError ? "#fbe9e7" : "#eaf5ec";
+      refs.pubMsg.style.borderColor = isError ? "#f0c9c3" : "#c6e2cb";
+      refs.pubMsg.textContent = text;
+    } else {
+      refs.pubMsg.className = "ha-err";
+      refs.pubMsg.textContent = "";
+    }
+    if (result && result.commit) {
+      refs.commitLink.className = "ha-note";
+      refs.commitLink.innerHTML = '本次提交：<a href="' + result.commit + '" target="_blank" rel="noopener">' + result.commit + "</a>";
+    }
+  }
+  function saveToken(token, remember) {
+    try {
+      if (remember) localStorage.setItem(TOKEN_KEY, token);
+      else localStorage.removeItem(TOKEN_KEY);
+    } catch (e) { /* 隐私模式下会失败，忽略 */ }
+  }
+  function loadRememberedToken() {
+    var inFile = (location.protocol === "file:");
+    try {
+      var t = localStorage.getItem(TOKEN_KEY);
+      if (t) refs.token.value = t;
+    } catch (e) { /* 无痕模式下读不到 */ }
+    if (inFile) {
+      refs.remember.disabled = true;
+      refs.remember.checked = false;
+      var n = el("div", "ha-note", "当前是 file:// 打开，浏览器禁止本地页面写 localStorage，「记住到本机」已禁用（发布功能本身仍可用）。");
+      refs.remember.parentNode.appendChild(n);
+    } else {
+      try { refs.remember.checked = !!localStorage.getItem(TOKEN_KEY); } catch (e) {}
+    }
+  }
+
+  /* ---------- D) 源码编辑器：任意仓库 / 任意文件 ---------- */
+  var srcState = { repo: "hall", path: "index.html", sha: null, original: "", loaded: false, exists: true, size: 0 };
+
+  /* 行级改动摘要：先用公共前缀/后缀裁剪，再对中间块做 LCS，得到准确的新增/删除行数。
+     文件很大时（中间块 > 100 万格）退化为「整块替换」的近似计数。 */
+  function lineDiffStat(oldText, newText) {
+    var A = String(oldText == null ? "" : oldText).split("\n");
+    var B = String(newText == null ? "" : newText).split("\n");
+    var p = 0;
+    while (p < A.length && p < B.length && A[p] === B[p]) p++;
+    var s = 0;
+    while (s < A.length - p && s < B.length - p && A[A.length - 1 - s] === B[B.length - 1 - s]) s++;
+    var midA = A.slice(p, A.length - s);
+    var midB = B.slice(p, B.length - s);
+    var lcs = 0, exact = true;
+    if (midA.length && midB.length) {
+      if (midA.length * midB.length <= 1000000) lcs = lcsLength(midA, midB);
+      else { lcs = 0; exact = false; }
+    }
+    return {
+      added: midB.length - lcs,
+      removed: midA.length - lcs,
+      oldLines: A.length,
+      newLines: B.length,
+      exact: exact,
+      changed: !(midA.length === 0 && midB.length === 0)
+    };
+  }
+  function lcsLength(a, b) {
+    var n = b.length, prev = new Int32Array(n + 1), cur = new Int32Array(n + 1);
+    for (var i = 0; i < a.length; i++) {
+      for (var j = 1; j <= n; j++) {
+        cur[j] = a[i] === b[j - 1] ? prev[j - 1] + 1 : (prev[j] >= cur[j - 1] ? prev[j] : cur[j - 1]);
+      }
+      var t = prev; prev = cur; cur = t;
+    }
+    return prev[n];
+  }
+  function diffText(d) {
+    if (!d.changed) return "内容没有变化";
+    return "改动摘要：" + (d.exact ? "" : "约 ") + "新增 " + d.added + " 行 / 删除 " + d.removed +
+      " 行（" + d.oldLines + " 行 → " + d.newLines + " 行）";
+  }
+  function srcDiff() {
+    return lineDiffStat(srcState.original, refs.srcText ? refs.srcText.value : "");
+  }
+  function srcToken() {
+    var t = refs.token ? refs.token.value.trim() : "";
+    return t;
+  }
+  function srcSay(text, isError) {
+    if (!refs.srcMsg) return;
+    refs.srcMsg.className = "ha-err" + (text ? " show" : "");
+    refs.srcMsg.style.color = isError ? "#9a2130" : "#2f6b3b";
+    refs.srcMsg.style.background = isError ? "#fbe9e7" : "#eaf5ec";
+    refs.srcMsg.style.borderColor = isError ? "#f0c9c3" : "#c6e2cb";
+    refs.srcMsg.textContent = text || "";
+  }
+  function srcStatus(extra) {
+    if (!refs.srcInfo) return;
+    var lines = refs.srcText ? refs.srcText.value.split("\n").length : 0;
+    var sha = srcState.sha ? srcState.sha.slice(0, 7) : (srcState.exists ? "—" : "新文件");
+    refs.srcInfo.textContent = REPO.owner + "/" + srcState.repo + "/" + srcState.path +
+      "　·　sha " + sha + "　·　" + (refs.srcText ? refs.srcText.value.length : 0) + " 字符 / " + lines + " 行" +
+      (srcState.loaded ? "" : "　·　（还没读取内容）") + (extra ? "　·　" + extra : "");
+  }
+  function renderSrcDiff() {
+    srcStatus();
+    if (refs.srcDiff) {
+      var d = srcDiff();
+      refs.srcDiff.textContent = srcState.loaded ? diffText(d) : "先点「读取文件」把内容拉下来再改";
+      refs.srcDiff.style.color = d.changed ? "#9a2130" : "#8a7376";
+    }
+  }
+  /* 切换仓库 → 重建文件下拉 */
+  function fillFileSelect(repo, keepPath) {
+    var list = FILE_PRESETS[repo] || ["index.html"];
+    refs.srcFile.innerHTML = "";
+    list.forEach(function (p) {
+      var o = el("option", null, p);
+      o.value = p;
+      refs.srcFile.appendChild(o);
+    });
+    var pick = (keepPath && list.indexOf(keepPath) >= 0) ? keepPath : list[0];
+    refs.srcFile.value = pick;
+    refs.srcPath.value = pick;
+  }
+  /* 读取文件（需要 Token；文件不存在时允许新建） */
+  function loadSource() {
+    var token = srcToken();
+    srcState.repo = refs.srcRepo.value;
+    srcState.path = (refs.srcPath.value || refs.srcFile.value || "").trim().replace(/^\/+/, "");
+    if (!srcState.path) { srcSay("请先填文件路径", true); return Promise.resolve(false); }
+    if (!token) { srcSay("请先在上面的「保存方式」里填 GitHub Token（读取文件也要鉴权）", true); return Promise.resolve(false); }
+    srcSay("正在读取 " + srcState.repo + "/" + srcState.path + " …", false);
+    return getFile(srcState.repo, srcState.path, token).then(function (data) {
+      if (!data) {
+        srcState.sha = null; srcState.original = ""; srcState.loaded = true; srcState.exists = false;
+        refs.srcText.value = "";
+        srcSay("文件不存在：可以在下面写内容，点「提交」会新建这个文件", false);
+        srcStatus(); renderSrcDiff();
+        return true;
+      }
+      if (data.type && data.type !== "file") { srcSay("这是一个目录，不是文件", true); return false; }
+      srcState.sha = data.sha;
+      srcState.exists = true;
+      srcState.size = data.size || 0;
+      srcState.original = data.content ? utf8B64(data.content) : "";
+      srcState.loaded = true;
+      refs.srcText.value = srcState.original;
+      srcSay("已读取 " + srcState.original.length + " 字符（sha " + String(data.sha).slice(0, 7) + "）", false);
+      srcStatus(); renderSrcDiff();
+      return true;
+    }).catch(function (e) {
+      srcState.loaded = false;
+      srcSay("读取失败：" + (e && e.message ? e.message : e), true);
+      return false;
+    });
+  }
+  /* 提交当前编辑内容（带二次确认） */
+  function commitSource() {
+    if (!srcState.loaded) { srcSay("请先点「读取文件」", true); return Promise.resolve({ ok: false, error: "还没读取文件" }); }
+    var token = srcToken();
+    if (!token) { srcSay("请先填 GitHub Token", true); return Promise.resolve({ ok: false, error: "缺少 Token" }); }
+    var content = refs.srcText.value;
+    if (!srcState.exists && !content.trim()) { srcSay("新文件内容不能为空", true); return Promise.resolve({ ok: false, error: "内容为空" }); }
+    var d = lineDiffStat(srcState.original, content);
+    if (d.changed === false) { srcSay("内容没有变化，无需提交", false); return Promise.resolve({ ok: false, error: "没有改动" }); }
+    var msg = "更新 " + srcState.path + "（管理员面板 " + nowText() + "）";
+    var ask = "即将提交到 " + REPO.owner + "/" + srcState.repo + "/" + srcState.path + "\n\n" +
+      diffText(d) + "\n提交信息：" + msg + "\n\n确认提交？";
+    var yes = false;
+    try { yes = window.confirm(ask); } catch (e) { yes = false; }
+    if (!yes) { srcSay("已取消提交（改动仍在编辑器里，可以点「复制当前内容」先备份）", false); return Promise.resolve({ ok: false, error: "用户取消" }); }
+    var btn = refs.srcCommitBtn;
+    if (btn) btn.disabled = true;
+    srcSay("正在提交 " + srcState.repo + "/" + srcState.path + " …", false);
+    var t0 = Date.now();
+    return commitFile(srcState.repo, srcState.path, token, content, srcState.sha, msg).then(function (r) {
+      if (btn) btn.disabled = false;
+      srcState.sha = r.sha || srcState.sha;
+      srcState.original = content;
+      srcState.exists = true;
+      srcSay("✅ 提交成功（" + ((Date.now() - t0) / 1000).toFixed(1) + "s）" + (r.commit ? "：" + r.commit : ""), false);
+      srcStatus(); renderSrcDiff();
+      return { ok: true, result: r, diff: d };
+    }).catch(function (e) {
+      if (btn) btn.disabled = false;
+      var m = e && e.message ? e.message : String(e);
+      if (e && e.status === 409) m = apiMessage(409, null, srcState.repo, srcState.path) + "（已自动重试一次，仍失败请重新读取文件）";
+      srcSay("❌ 提交失败：" + m, true);
+      return { ok: false, error: m, status: e && e.status };
+    });
+  }
+  function copySource() {
+    var text = refs.srcText ? refs.srcText.value : "";
+    if (!text && !srcState.loaded) { srcSay("还没有可复制的内容", true); return false; }
+    copyText(text).then(function () { toast("已复制 " + srcState.repo + "/" + srcState.path + " 当前内容（" + text.length + " 字符）"); })
+      .catch(function () { toast("复制失败，请手动全选编辑器内容", "err"); });
+    return true;
+  }
+  function revertSource() {
+    if (!srcState.loaded) { srcSay("还没有读取过文件", true); return; }
+    refs.srcText.value = srcState.original;
+    srcSay("已还原为最近一次读取/提交的内容", false);
+    renderSrcDiff();
+  }
+
+  /* ---------- E) 数据面板：读取同源 localStorage ---------- */
+  function readKey(k) {
+    try { return localStorage.getItem(k); } catch (e) { return null; }
+  }
+  function readJson(k) {
+    var raw = readKey(k);
+    if (raw == null) return null;
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  }
+  function num(v) {
+    if (typeof v === "number" && isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
+    return null;
+  }
+  function pickNum(o, keys) {
+    if (o == null) return null;
+    if (typeof o === "number" || typeof o === "string") return num(o);
+    if (typeof o !== "object") return null;
+    for (var i = 0; i < keys.length; i++) {
+      var n = num(o[keys[i]]);
+      if (n != null) return n;
+    }
+    return null;
+  }
+  function countKeys(v) {
+    if (v == null) return null;
+    if (Array.isArray(v)) return v.length;
+    if (typeof v === "object") return Object.keys(v).length;
+    var n = num(v);
+    return n == null ? null : n;
+  }
+  /* 把 localStorage 里的原始字符串解析成「数组 / 对象 / 字符串」三态 */
+  function parseLoose(raw) {
+    if (raw == null) return null;
+    try {
+      var j = JSON.parse(raw);
+      return j == null ? null : j;
+    } catch (e) { return raw; }
+  }
+  function asList(v) { return Array.isArray(v) ? v : null; }
+  /* 对象里所有数值型字段取最大值（合成按 easy/hard/super 分难度存分） */
+  function maxNumField(o) {
+    if (o == null || typeof o !== "object" || Array.isArray(o)) return num(o);
+    var best = null;
+    for (var k in o) {
+      if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+      var n = num(o[k]);
+      if (n != null && (best == null || n > best)) best = n;
+    }
+    return best;
+  }
+  function cellVal(row, field) {
+    var v = row.values[field];
+    if (v == null || v === "") return "—";
+    if (field === "progress" && row.total) return v + "/" + row.total;
+    if (field === "best") return String(v) + " 分";
+    if (field === "ends") return String(v) + " 个";
+    return String(v);
+  }
+  /* 每个游戏的真实存储格式见各仓库源码：
+     合成  : best:v2 = {easy,hard,super} 的 JSON；codex:v1 = 已解锁图鉴的 JSON 数组
+     跳一跳: best:v1 = 数字字符串；chai:v1 = 已遇到的钗的 JSON 数组
+     切西瓜: best:v1 = 数字字符串；progress:v1 = {v,unlocked,best:[每关最好成绩]} 
+     十二钗: ends:v1 = 已解锁结局的 JSON 数组；save:v1 = 存档对象 */
+  function readStats() {
+    var rows = [];
+
+    var mergeBest = parseLoose(readKey(STATS_KEYS.mergeBest));
+    var mergeCodex = parseLoose(readKey(STATS_KEYS.mergeCodex));
+    var mergeBestN = maxNumField(mergeBest);
+    var mergeCodexN = countKeys(mergeCodex);
+    rows.push({
+      title: "合成杨璐恺",
+      keys: STATS_KEYS.mergeBest + " / " + STATS_KEYS.mergeCodex,
+      values: { best: mergeBestN, progress: mergeCodexN, ends: null },
+      total: null,
+      extra: (mergeBestN == null && mergeCodexN == null) ? "键不存在或无数据"
+        : "最高分取 easy/hard/super 里的最大值 · 进度 = codex 已解锁图鉴条数"
+    });
+
+    var jumpBest = readKey(STATS_KEYS.jumpBest);
+    var jumpChai = asList(parseLoose(readKey(STATS_KEYS.jumpChai)));
+    rows.push({
+      title: "跳一跳 · 璐恺版",
+      keys: STATS_KEYS.jumpBest + " / " + STATS_KEYS.jumpChai,
+      values: { best: num(jumpBest), progress: jumpChai ? jumpChai.length : null, ends: null },
+      total: null,
+      extra: jumpChai && jumpChai.length
+        ? "进度 = 已遇到的钗（" + jumpChai.slice(0, 3).join("、") + (jumpChai.length > 3 ? " 等" : "") + "）"
+        : "键不存在或无数据"
+    });
+
+    var fruitBest = readKey(STATS_KEYS.fruitBest);
+    var fruitProg = parseLoose(readKey(STATS_KEYS.fruitProgress));
+    var fruitProgN = pickNum(fruitProg, ["unlocked", "level", "progress", "stage", "current"]);
+    var fruitLevels = asList(fruitProg && fruitProg.best);
+    var fruitTotal = pickNum(fruitProg, ["total", "maxLevel", "levels"]) || (fruitLevels ? fruitLevels.length : null);
+    rows.push({
+      title: "切西瓜 · 璐恺版",
+      keys: STATS_KEYS.fruitBest + " / " + STATS_KEYS.fruitProgress,
+      values: { best: num(fruitBest), progress: fruitProgN, ends: null },
+      total: fruitTotal,
+      extra: (num(fruitBest) == null && fruitProgN == null) ? "键不存在或无数据"
+        : "进度 = progress.unlocked（已解锁关卡）"
+    });
+
+    var galEnds = asList(parseLoose(readKey(STATS_KEYS.galEnds)));
+    var galSave = parseLoose(readKey(STATS_KEYS.galSave));
+    rows.push({
+      title: "璐恺十二钗",
+      keys: STATS_KEYS.galEnds + " / " + STATS_KEYS.galSave,
+      values: { best: null, progress: countKeys(galSave), ends: galEnds ? galEnds.length : null },
+      total: null,
+      extra: (galEnds == null && galSave == null) ? "键不存在或无数据"
+        : "结局数 = ends 已解锁条数 · 进度 = save 存档字段数"
+    });
+    return rows;
+  }
+  function renderStats() {
+    var host = refs.stats;
+    host.innerHTML = "";
+    var inFile = (location.protocol === "file:");
+    /* 先探测一次 localStorage 是否真的能读：file:// / 不透明源下会抛 SecurityError */
+    var storageOk = true;
+    try { localStorage.getItem("__hall_probe__"); } catch (e) { storageOk = false; }
+    if (inFile || !storageOk) {
+      var w = el("div", "ha-warn");
+      w.textContent = "当前是 file:// 直接打开（或浏览器禁用了本站 localStorage），浏览器把每个本地文件当独立源，读不到其它游戏的 localStorage（同源限制）。" +
+        "把大厅放到线上（https://merge-games.github.io/hall/）再打开本面板即可看到真实数据；下表为占位。";
+      host.appendChild(w);
+    }
+    var rows = readStats();
+    var t = el("table", "ha-table");
+    var thead = el("thead");
+    var tr = el("tr");
+    ["游戏", "最高分", "收集进度", "结局数"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+    thead.appendChild(tr); t.appendChild(thead);
+    var tb = el("tbody");
+    rows.forEach(function (r) {
+      var row = el("tr");
+      row.appendChild(el("td", null, r.title));
+      row.appendChild(el("td", null, cellVal(r, "best")));
+      row.appendChild(el("td", null, cellVal(r, "progress")));
+      row.appendChild(el("td", null, cellVal(r, "ends")));
+      tb.appendChild(row);
+      var row2 = el("tr");
+      var td = el("td", "ha-kv");
+      td.colSpan = 4;
+      td.textContent = r.keys + "　·　" + r.extra;
+      row2.appendChild(td);
+      tb.appendChild(row2);
+    });
+    t.appendChild(tb);
+    host.appendChild(t);
+    var refresh = el("button", null, "刷新数据");
+    refresh.style.marginTop = "10px";
+    refresh.addEventListener("click", function () { renderStats(); toast("已重新读取 localStorage"); });
+    host.appendChild(refresh);
+    updateDiagMeta();
+  }
+
+  /* ---------- 自检行（给无头测试用；也方便线上快速确认） ---------- */
+  function paintErr() {
+    if (!refs.selfcheck) return;
+    refs.selfcheck.textContent = "运行时错误：" + errCount + (errLast ? "（" + errLast + "）" : "");
+  }
+
+  /* ---------- 面板总装 ---------- */
+  function build() {
+    injectStyle();
+    overlayEl = el("div");
+    overlayEl.id = "hallAdminRoot";
+
+    var panel = el("div", "ha-panel");
+
+    /* 头部 */
+    var head = el("div", "ha-head");
+    head.appendChild(el("h2", null, "大厅管理员面板"));
+    head.appendChild(el("span", "ha-badge", "隐藏入口"));
+    head.appendChild(el("span", "ha-spacer"));
+    var exit = el("button", "ha-primary", "退出管理");
+    exit.id = "haExit";
+    head.appendChild(exit);
+    panel.appendChild(head);
+
+    var tip = el("div", "ha-note", "入口：网址加 ?admin=1 或 #admin，或 2 秒内连点页面标题 5 次。面板内所有改动会立刻反映到下方页面卡片上。");
+    tip.style.marginTop = "10px";
+    panel.appendChild(tip);
+
+    /* A) 游戏清单 */
+    panel.appendChild(el("h3", null, "A · 游戏清单（编辑 / 排序 / 删除 / 新增）"));
+    var toolbar = el("div", "ha-row");
+    var addBtn = el("button", "ha-primary", "＋ 新增游戏");
+    addBtn.id = "haAdd";
+    var resetBtn = el("button", null, "恢复本次打开时的内容");
+    resetBtn.id = "haReset";
+    toolbar.appendChild(addBtn); toolbar.appendChild(resetBtn);
+    panel.appendChild(toolbar);
+    refs.list = el("div", "ha-list");
+    refs.list.id = "haList";
+    refs.list.style.marginTop = "10px";
+    panel.appendChild(refs.list);
+    refs.err = el("div", "ha-err");
+    refs.err.id = "haErr";
+    panel.appendChild(refs.err);
+
+    /* 大厅设置 */
+    panel.appendChild(el("h3", null, "B · 大厅设置"));
+    var setWrap = el("div");
+    var w1 = el("div", "ha-grid2");
+    refs.t1 = el("input"); refs.t1.type = "text"; refs.t1.id = "haTitle";
+    w1.appendChild(wrapField("标题 HALL_TITLE", HALL_TITLE, refs.t1));
+    refs.t2 = el("input"); refs.t2.type = "text"; refs.t2.id = "haSub";
+    w1.appendChild(wrapField("副标题 HALL_SUB", HALL_SUB, refs.t2));
+    setWrap.appendChild(w1);
+    var dW = el("div");
+    dW.appendChild(el("label", "ha-lab", "底部纪念文字（换行会保留）"));
+    refs.t3 = el("textarea");
+    refs.t3.id = "haDedication";
+    refs.t3.rows = 4;
+    refs.t3.value = HALL_DEDICATION;
+    dW.appendChild(refs.t3);
+    dW.style.marginTop = "8px";
+    setWrap.appendChild(dW);
+    panel.appendChild(setWrap);
+
+    /* 保存方式 */
+    panel.appendChild(el("h3", null, "C · 保存方式"));
+    var save1 = el("div", "ha-row");
+    var copyBtn = el("button", "ha-primary", "① 复制 GAMES 代码");
+    copyBtn.id = "haCopy";
+    save1.appendChild(copyBtn);
+    var dlBtn = el("button", null, "② 下载 index.html");
+    dlBtn.id = "haDownload";
+    save1.appendChild(dlBtn);
+    panel.appendChild(save1);
+    refs.out = el("textarea", "ha-out");
+    refs.out.id = "haOut";
+    refs.out.spellcheck = false;
+    panel.appendChild(refs.out);
+
+    var pubBox = el("div");
+    pubBox.style.marginTop = "10px";
+    var lw = el("div");
+    lw.appendChild(el("label", "ha-lab", "GitHub Token（建议 fine-grained，只勾这一个仓库的 Contents: Read and write）"));
+    refs.token = el("input");
+    refs.token.type = "password";
+    refs.token.id = "haToken";
+    refs.token.autocomplete = "off";
+    refs.token.placeholder = "github_pat_… 或 ghp_…";
+    lw.appendChild(refs.token);
+    pubBox.appendChild(lw);
+
+    var remRow = el("div", "ha-row");
+    remRow.style.marginTop = "8px";
+    refs.remember = el("input");
+    refs.remember.type = "checkbox";
+    refs.remember.id = "haRemember";
+    var remLab = el("label");
+    remLab.style.display = "inline-flex";
+    remLab.style.alignItems = "center";
+    remLab.style.gap = "6px";
+    remLab.style.cursor = "pointer";
+    remLab.appendChild(refs.remember);
+    remLab.appendChild(document.createTextNode("记住到本机（localStorage）"));
+    var toggle = el("button", null, "显示");
+    toggle.id = "haToggleToken";
+    remRow.appendChild(remLab);
+    remRow.appendChild(toggle);
+    pubBox.appendChild(remRow);
+
+    var warn = el("div", "ha-warn");
+    warn.style.marginTop = "8px";
+    warn.innerHTML = "⚠ 安全提示：勾选「记住到本机」会把 Token 明文写进浏览器 localStorage（键 <code>hall-admin:token:v1</code>），" +
+      "同一个站点下的任何脚本都能读到，公共电脑上不要勾。默认只在内存里，刷新页面就没了；" +
+      "Token 只发给 api.github.com，请用最小权限 + 设置过期时间，怀疑泄露立刻去 GitHub 删除。";
+    pubBox.appendChild(warn);
+
+    var pubRow = el("div", "ha-row");
+    pubRow.style.marginTop = "10px";
+    refs.publishBtn = el("button", "ha-primary", "③ 发布到 GitHub");
+    refs.publishBtn.id = "haPublish";
+    pubRow.appendChild(refs.publishBtn);
+    var note = el("span", "ha-note", "GET 拿 sha → PUT " + REPO.path + "（branch " + REPO.branch + "）");
+    pubRow.appendChild(note);
+    pubBox.appendChild(pubRow);
+
+    refs.pubMsg = el("div", "ha-err");
+    refs.pubMsg.id = "haPubMsg";
+    pubBox.appendChild(refs.pubMsg);
+    refs.commitLink = el("div", "ha-note");
+    refs.commitLink.id = "haCommit";
+    pubBox.appendChild(refs.commitLink);
+    panel.appendChild(pubBox);
+
+    /* D 源码编辑器：任意仓库 / 任意文件 */
+    panel.appendChild(el("h3", null, "D · 源码编辑器（任意仓库 / 任意文件，读取 → 编辑 → 提交）"));
+    var srcTip = el("div", "ha-note", "用上面 C 区填的同一个 Token。仓库固定为 " + REPO.owner + "，分支 " + REPO.branch +
+      "；文件路径可以手填（如 assets/main.js），不存在的路径提交时会新建。");
+    srcTip.style.marginTop = "-4px";
+    panel.appendChild(srcTip);
+
+    var srcRow = el("div", "ha-row");
+    srcRow.style.marginTop = "8px";
+    var repoLab = el("label", "ha-lab", "仓库");
+    repoLab.style.margin = "0";
+    srcRow.appendChild(repoLab);
+    refs.srcRepo = el("select");
+    refs.srcRepo.id = "haSrcRepo";
+    REPOS.forEach(function (r) {
+      var o = el("option", null, r);
+      o.value = r;
+      refs.srcRepo.appendChild(o);
+    });
+    refs.srcRepo.value = "hall";
+    srcRow.appendChild(refs.srcRepo);
+    var fileLab = el("label", "ha-lab", "预置文件");
+    fileLab.style.margin = "0";
+    srcRow.appendChild(fileLab);
+    refs.srcFile = el("select");
+    refs.srcFile.id = "haSrcFile";
+    srcRow.appendChild(refs.srcFile);
+    panel.appendChild(srcRow);
+
+    var pathRow = el("div", "ha-row");
+    pathRow.style.marginTop = "8px";
+    refs.srcPath = el("input");
+    refs.srcPath.type = "text";
+    refs.srcPath.id = "haSrcPath";
+    refs.srcPath.placeholder = "任意路径，例如 index.html / assets/main.js / README.md";
+    refs.srcPath.style.flex = "1";
+    pathRow.appendChild(refs.srcPath);
+    refs.srcLoadBtn = el("button", "ha-primary", "读取文件");
+    refs.srcLoadBtn.id = "haSrcLoad";
+    pathRow.appendChild(refs.srcLoadBtn);
+    panel.appendChild(pathRow);
+
+    refs.srcInfo = el("div", "ha-note", "");
+    refs.srcInfo.id = "haSrcInfo";
+    refs.srcInfo.style.marginTop = "6px";
+    panel.appendChild(refs.srcInfo);
+
+    refs.srcText = el("textarea", "ha-src");
+    refs.srcText.id = "haSrcText";
+    refs.srcText.spellcheck = false;
+    refs.srcText.rows = 12;
+    refs.srcText.placeholder = "读取后的文件内容会出现在这里；可以直接改，改完点「提交到 GitHub」。";
+    panel.appendChild(refs.srcText);
+
+    refs.srcDiff = el("div", "ha-note", "");
+    refs.srcDiff.id = "haSrcDiff";
+    refs.srcDiff.style.marginTop = "6px";
+    panel.appendChild(refs.srcDiff);
+
+    var srcBtnRow = el("div", "ha-row");
+    srcBtnRow.style.marginTop = "8px";
+    refs.srcCopyBtn = el("button", null, "复制当前内容（备份）");
+    refs.srcCopyBtn.id = "haSrcCopy";
+    srcBtnRow.appendChild(refs.srcCopyBtn);
+    refs.srcRevertBtn = el("button", null, "撤销未保存的修改");
+    refs.srcRevertBtn.id = "haSrcRevert";
+    srcBtnRow.appendChild(refs.srcRevertBtn);
+    refs.srcCommitBtn = el("button", "ha-primary", "提交到 GitHub");
+    refs.srcCommitBtn.id = "haSrcCommit";
+    srcBtnRow.appendChild(refs.srcCommitBtn);
+    panel.appendChild(srcBtnRow);
+
+    refs.srcMsg = el("div", "ha-err");
+    refs.srcMsg.id = "haSrcMsg";
+    panel.appendChild(refs.srcMsg);
+
+    /* E 数据面板 */
+    panel.appendChild(el("h3", null, "E · 数据面板（同源读取各游戏本机成绩，只读）"));
+    refs.stats = el("div");
+    refs.stats.id = "haStats";
+    panel.appendChild(refs.stats);
+
+    panel.appendChild(el("h3", null, "自检"));
+    refs.selfcheck = el("div", "ha-note", "运行时错误：0");
+    refs.selfcheck.id = "haSelfcheck";
+    panel.appendChild(refs.selfcheck);
+
+    refs.toast = el("div", "ha-toast");
+    refs.toast.id = "haToast";
+    panel.appendChild(refs.toast);
+
+    overlayEl.appendChild(panel);
+    document.body.appendChild(overlayEl);
+
+    /* ---- 事件 ---- */
+    exit.addEventListener("click", function () { close(); });
+    overlayEl.addEventListener("click", function (e) { if (e.target === overlayEl) close(); });
+    document.addEventListener("keydown", function (e) {
+      if (adminOpen && (e.key === "Escape" || e.keyCode === 27)) close();
+    });
+    addBtn.addEventListener("click", function () {
+      var list = collectGames();
+      list.push({ title: "新游戏", desc: "", url: "https://merge-games.github.io/", cover: "", tag: "" });
+      applyList(list, list.length - 1);
+      toast("已新增一条（记得改标题和链接）");
+    });
+    resetBtn.addEventListener("click", function () {
+      applyList(clone(snap.games), 0);
+      refs.t1.value = snap.title; refs.t2.value = snap.sub; refs.t3.value = snap.dedication;
+      applySettings();
+      toast("已恢复到本次打开面板时的内容");
+    });
+    refs.list.addEventListener("click", function (e) {
+      var b = e.target;
+      if (!b || b.tagName !== "BUTTON" || !b._act) return;
+      var box = b.parentNode.parentNode;
+      var idx = Number(box._index);
+      var list = collectGames();
+      if (b._act === "del") {
+        list.splice(idx, 1);
+        applyList(list, Math.max(0, idx - 1));
+        toast("已删除第 " + (idx + 1) + " 条");
+      } else if (b._act === "up" && idx > 0) {
+        var t = list[idx - 1]; list[idx - 1] = list[idx]; list[idx] = t;
+        applyList(list, idx - 1);
+      } else if (b._act === "down" && idx < list.length - 1) {
+        var t2 = list[idx + 1]; list[idx + 1] = list[idx]; list[idx] = t2;
+        applyList(list, idx + 1);
+      }
+    });
+    [refs.t1, refs.t2, refs.t3].forEach(function (i) { i.addEventListener("input", applySettings); });
+    copyBtn.addEventListener("click", doCopy);
+    dlBtn.addEventListener("click", doDownload);
+    refs.publishBtn.addEventListener("click", doPublish);
+    toggle.addEventListener("click", function () {
+      var show = refs.token.type === "password";
+      refs.token.type = show ? "text" : "password";
+      toggle.textContent = show ? "隐藏" : "显示";
+    });
+    refs.remember.addEventListener("change", function () {
+      if (!refs.remember.checked) saveToken("", false);
+    });
+
+    /* 源码编辑器事件 */
+    fillFileSelect("hall", "index.html");
+    refs.srcRepo.addEventListener("change", function () {
+      srcState.loaded = false;
+      fillFileSelect(refs.srcRepo.value, null);
+      refs.srcText.value = "";
+      srcSay("已切换到 " + refs.srcRepo.value + "/" + refs.srcPath.value + "，点「读取文件」加载", false);
+      renderSrcDiff();
+    });
+    refs.srcFile.addEventListener("change", function () {
+      refs.srcPath.value = refs.srcFile.value;
+      loadSource();
+    });
+    refs.srcLoadBtn.addEventListener("click", function () { loadSource(); });
+    refs.srcText.addEventListener("input", renderSrcDiff);
+    refs.srcCopyBtn.addEventListener("click", copySource);
+    refs.srcRevertBtn.addEventListener("click", revertSource);
+    refs.srcCommitBtn.addEventListener("click", function () { commitSource(); });
+    srcState.repo = "hall";
+    srcState.path = "index.html";
+    srcStatus();
+
+    paintErr();
+  }
+
+  /* 用给定清单重建列表（供新增/删除/排序使用） */
+  function applyList(list, selectIndex) {
+    refs.list.innerHTML = "";
+    list.forEach(function (g, i) { refs.list.appendChild(buildItem(g, i)); });
+    GAMES = collectGames();
+    renderHall();
+    if (typeof selectIndex === "number" && refs.list.children[selectIndex]) {
+      refs.list.children[selectIndex].scrollIntoView({ block: "nearest" });
+    }
+  }
+  /* 把面板当前内容以 meta 属性形式写进 DOM，方便无头浏览器在 file:// 下断言（普通访客看不到） */
+  function updateDiagMeta() {
+    try {
+      var body = document.body;
+      if (!body || !refs.stats) return;
+      body.setAttribute("data-ha-dump", JSON.stringify({
+        cards: document.querySelectorAll("#grid a.card").length,
+        titles: (function () {
+          var o = [], n = document.querySelectorAll("#grid .name");
+          for (var i = 0; i < n.length; i++) o.push(n[i].textContent);
+          return o;
+        })(),
+        hallTitle: (document.getElementById("hallTitle") || {}).textContent || "",
+        hallSub: (document.getElementById("hallSub") || {}).textContent || "",
+        stats: refs.stats.textContent.replace(/\s+/g, " ").trim().slice(0, 1500),
+        errors: errCount
+      }));
+    } catch (e) { /* 诊断属性失败不影响功能 */ }
+  }
+  function wrapField(labelText, value, input) {
+    var w = el("div");
+    w.appendChild(el("label", "ha-lab", labelText));
+    input.value = value == null ? "" : value;
+    if (input.type !== "text") input.type = "text";
+    w.appendChild(input);
+    return w;
+  }
+  function applySettings() {
+    HALL_TITLE = refs.t1.value;
+    HALL_SUB = refs.t2.value;
+    HALL_DEDICATION = refs.t3.value;
+    document.title = HALL_TITLE;
+    var ht = document.getElementById("hallTitle");
+    if (ht) ht.textContent = HALL_TITLE;
+    var hs = document.getElementById("hallSub");
+    if (hs) hs.textContent = HALL_SUB;
+    var hd = document.getElementById("dedication");
+    if (hd) hd.textContent = HALL_DEDICATION;
+  }
+  function clone(x) { return JSON.parse(JSON.stringify(x)); }
+
+  /* ---------- 开关 ---------- */
+  function open() {
+    if (adminOpen) return;
+    adminOpen = true;
+    snap = {
+      games: GAMES.map(function (g) {
+        return { title: g.title, desc: g.desc, url: g.url, cover: g.cover, tag: g.tag };
+      }),
+      title: HALL_TITLE,
+      sub: HALL_SUB,
+      dedication: HALL_DEDICATION
+    };
+    build();
+    fillList();
+    refs.t1.value = HALL_TITLE;
+    refs.t2.value = HALL_SUB;
+    refs.t3.value = HALL_DEDICATION;
+    loadRememberedToken();
+    renderStats();
+    updateDiagMeta();
+    stripAccessFlag();
+  }
+  function close() {
+    if (!adminOpen) return;
+    adminOpen = false;
+    if (overlayEl && overlayEl.parentNode) overlayEl.parentNode.removeChild(overlayEl);
+    overlayEl = null;
+    refs = {};
+    /* 连注入的样式一起撤掉，关掉后页面与普通访客看到的完全一致 */
+    var st = document.getElementById("hallAdminStyle");
+    if (st && st.parentNode) st.parentNode.removeChild(st);
+    try { document.body.removeAttribute("data-ha-dump"); } catch (e) {}
+    /* 关掉后内容仍是编辑后的状态，只是不再有面板 */
+    stripAccessFlag();
+  }
+  function stripAccessFlag() {
+    try {
+      if (/[?&]admin=1/.test(location.search)) {
+        var q = location.search.replace(/([?&])admin=1&?/, function (m, p) { return p === "?" ? "?" : ""; }).replace(/[?&]$/, "");
+        history.replaceState(null, "", location.pathname + q + location.hash);
+      } else if (location.hash === "#admin") {
+        history.replaceState(null, "", location.pathname + location.search);
+      }
+    } catch (e) { /* file:// 下部分浏览器不允许 replaceState，忽略 */ }
+  }
+
+  /* ---------- 触发 1：URL 参数 ---------- */
+  function matchAccess() {
+    var q = location.search || "";
+    var h = location.hash || "";
+    var m = q.match(/[?&]admin=([^&#]*)/);
+    if (m && (m[1] === "1" || m[1] === "")) return true;
+    if (h === "#admin" || h === "#admin=1") return true;
+    return false;
+  }
+  function maybeOpenByUrl() { if (matchAccess()) open(); }
+
+  /* ---------- 触发 2：2 秒内连点标题 5 次 ---------- */
+  function bindGesture() {
+    var h1 = document.getElementById("hallTitle");
+    if (!h1) return;
+    var hits = [];
+    h1.addEventListener("click", function () {
+      var now = Date.now();
+      hits = hits.filter(function (t) { return now - t < 2000; });
+      hits.push(now);
+      if (hits.length >= 5) { hits = []; open(); }
+    });
+  }
+  bindGesture();
+  maybeOpenByUrl();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", maybeOpenByUrl);
+  }
+
+  /* ---------- 暴露给自动化测试（不影响普通访客） ---------- */
+  window.__HALL_ADMIN__ = {
+    version: 1,
+    isOpen: function () { return adminOpen; },
+    open: function () { open(); return adminOpen; },
+    close: function () { close(); return adminOpen; },
+    games: function () { return clone(GAMES); },
+    settings: function () { return { title: HALL_TITLE, sub: HALL_SUB, dedication: HALL_DEDICATION }; },
+    add: function () { var b = document.getElementById("haAdd"); if (b) { b.click(); return true; } return false; },
+    remove: function (i) { var it = refs.list && refs.list.children[i]; if (!it) return false; var b = it.querySelector("button.ha-danger"); b.click(); return true; },
+    move: function (i, dir) {
+      var it = refs.list && refs.list.children[i]; if (!it) return false;
+      var btns = it.querySelectorAll("button");
+      for (var k = 0; k < btns.length; k++) if (btns[k]._act === dir) { btns[k].click(); return true; }
+      return false;
+    },
+    setField: function (i, name, value) {
+      var it = refs.list && refs.list.children[i]; if (!it) return false;
+      var key = { title: "_title", desc: "_desc", url: "_url", cover: "_cover", tag: "_tag" }[name];
+      if (!key || !it[key]) return false;
+      it[key].value = value;
+      it[key].dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    },
+    setSetting: function (name, value) {
+      var m = { title: refs.t1, sub: refs.t2, dedication: refs.t3 }[name];
+      if (!m) return false;
+      m.value = value;
+      m.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    },
+    gamesCode: function () { return gamesCode(collectGames()); },
+    buildHtml: function () { return buildForSave(); },
+    buildHtmlError: function () { return buildForSaveError; },
+    diag: function () {
+      var src = cleanSource();
+      var r = findGamesRange(src);
+      return {
+        srcLen: src.length,
+        hasVarGames: src.indexOf("var GAMES"),
+        markA: src.split(MARK_A).length - 1,
+        markB: src.split(MARK_B).length - 1,
+        range: r,
+        doctype: src.slice(0, 15),
+        adminLeak: src.indexOf(NEEDLE_PANEL) >= 0 || src.indexOf(NEEDLE_STYLE) >= 0,
+        titleVars: [/var\s+HALL_TITLE\s*=\s*[\s\S]*?;/.test(src), /var\s+HALL_SUB\s*=\s*[\s\S]*?;/.test(src),
+          /var\s+HALL_DEDICATION\s*=\s*[\s\S]*?;/.test(src)]
+      };
+    },
+    /* 产物不做任何修补地自检一遍（下载/发布前的闸门） */
+    verify: function () {
+      var html = buildForSave();
+      return { ok: !!html, error: buildForSaveError, len: html ? html.length : null };
+    },
+    validate: function () { return validateGames(collectGames()); },
+    /* 产物守卫的直连入口（只给自动化测试用）：传入任意源码，看它会不会被拒绝 */
+    buildModified: function (src, games, title, sub, dedication) {
+      try { return buildModifiedHtml(src, games || collectGames(), title, sub, dedication); }
+      catch (e) { return { ok: false, error: "抛异常：" + (e && e.message ? e.message : e) }; }
+    },
+    verifyOutput: function (html) { return verifyOutput(html, collectGames()); },
+    publish: function (token) {
+      var html = buildForSave();
+      if (!html) return Promise.resolve({ ok: false, error: "生成失败" });
+      return publish(token, html, "测试提交").then(function (r) { return { ok: true, result: r }; })
+        .catch(function (e) { return { ok: false, error: e && e.message ? e.message : String(e), status: e && e.status }; });
+    },
+    tokenValue: function () { return refs.token ? refs.token.value : null; },
+    download: function () {
+      var btn = document.getElementById("haDownload");
+      if (!btn) return false;
+      try { btn.click(); return true; } catch (e) { return false; }
+    },
+    errCount: function () { return errCount; },
+    cardCount: function () { return document.querySelectorAll("#grid a.card").length; },
+    cardTitles: function () {
+      var out = [];
+      var ns = document.querySelectorAll("#grid .name");
+      for (var i = 0; i < ns.length; i++) out.push(ns[i].textContent);
+      return out;
+    },
+    panelVisible: function () {
+      var o = document.getElementById("hallAdminRoot");
+      if (!o) return false;
+      var cs = getComputedStyle(o);
+      if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+      return o.offsetWidth > 0 && o.offsetHeight > 0;
+    },
+    statsText: function () {
+      var t = document.getElementById("haStats");
+      return t ? t.textContent.replace(/\s+/g, " ").trim() : "";
+    },
+    /* 源码编辑器（供自动化测试驱动） */
+    src: {
+      repos: function () { return REPOS.slice(); },
+      presets: function () { return clone(FILE_PRESETS); },
+      state: function () {
+        return { repo: srcState.repo, path: srcState.path, sha: srcState.sha, loaded: srcState.loaded,
+          exists: srcState.exists, len: refs.srcText ? refs.srcText.value.length : 0 };
+      },
+      select: function (repo, path) {
+        if (!refs.srcRepo || !refs.srcFile) return false;
+        if (REPOS.indexOf(repo) < 0) return false;
+        refs.srcRepo.value = repo;
+        fillFileSelect(repo, path || null);
+        if (path) refs.srcPath.value = path;
+        srcState.loaded = false;
+        return true;
+      },
+      load: function (repo, path) {
+        if (!refs.srcRepo) return Promise.resolve(false);
+        if (repo && REPOS.indexOf(repo) >= 0) { refs.srcRepo.value = repo; }
+        if (path) { refs.srcPath.value = path; }
+        return loadSource();
+      },
+      content: function () { return refs.srcText ? refs.srcText.value : ""; },
+      setContent: function (s) {
+        if (!refs.srcText) return false;
+        refs.srcText.value = s;
+        renderSrcDiff();
+        return true;
+      },
+      diff: function () { return srcDiff(); },
+      diffText: function () { return diffText(srcDiff()); },
+      commit: function () { return commitSource(); },
+      copy: function () { return copySource(); },
+      revert: function () { return revertSource(); },
+      statusText: function () { return refs.srcInfo ? refs.srcInfo.textContent : ""; },
+      msgText: function () { return refs.srcMsg ? refs.srcMsg.textContent : ""; },
+      fileOptions: function () {
+        var out = [], os = refs.srcFile ? refs.srcFile.options : [];
+        for (var i = 0; i < os.length; i++) out.push(os[i].value);
+        return out;
+      }
+    },
+    hash: function () { return location.hash; },
+    search: function () { return location.search; }
+  };
 })();
 </script>
 </body>
