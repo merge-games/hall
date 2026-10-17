@@ -893,8 +893,8 @@ var GAMES = [
   },
   {
     title: "华南理工大学",
-    desc: "校园风采小站：要闻、通知、院系一览（练习作品，非学校官方网站）",
-    url: "https://merge-games.github.io/hall/scut/",
+    desc: "华南理工大学官网（scut.edu.cn）",
+    url: "https://scut.edu.cn",
     cover: "https://merge-games.github.io/hall/scut/assets/campus.jpg",
     tag: "网站",
     on: true
@@ -925,6 +925,7 @@ function renderHall() {
     a.className = "card";
     a.href = g.url;
     a.rel = "noopener";
+    if (g.tag === "网站") a.target = "_blank";   // 官网等外站新标签页打开
 
     var cover = document.createElement("div");
     cover.className = "cover";
