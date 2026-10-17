@@ -893,10 +893,10 @@ var GAMES = [
   },
   {
     title: "华南理工大学",
-    desc: "华工官网",
+    desc: "校园风采小站：要闻、通知、院系一览（练习作品，非学校官方网站）",
     url: "https://merge-games.github.io/hall/scut/",
-    cover: "",
-    tag: "",
+    cover: "https://merge-games.github.io/hall/scut/assets/campus.jpg",
+    tag: "网站",
     on: true
   }
 ];
@@ -947,7 +947,7 @@ function renderHall() {
     de.textContent = g.desc || "";
     var pl = document.createElement("div");
     pl.className = "play";
-    pl.textContent = "开始玩";
+    pl.textContent = (g.tag === "网站") ? "进入网站" : "开始玩";
     body.appendChild(nm);
     body.appendChild(de);
     body.appendChild(pl);
