@@ -2965,7 +2965,7 @@ renderHall();
       try { return buildModifiedHtml(src, games || collectGames(), title, sub, dedication, sec); }
       catch (e) { return { ok: false, error: "抛异常：" + (e && e.message ? e.message : e) }; }
     },
-    verifyOutput: function (html, sec) { return verifyOutput(html, collectGames(), sec || null); },
+    verifyOutput: function (html, sec, games) { return verifyOutput(html, games || collectGames(), sec || null); },
     /* 只走字符串生成，不点「下载」按钮（无头 Chrome 点下载会挂住） */
     buildString: function () { return buildForSave(); },
     /* 改了密码之后、不想发布时，直接拿产物字符串 */
