@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-immersive-translate-page-theme="light"><plasmo-csui id="dx-sibebar-container"></plasmo-csui><head>
+<html lang="zh-CN" data-immersive-translate-page-theme="light"><head></head><body><plasmo-csui id="dx-sibebar-container"></plasmo-csui>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="theme-color" content="#7a1220">
@@ -800,8 +800,8 @@ xm-select[size='mini'] .item--divided {
 .layui-form-pane xm-select {
   margin: -1px -1px -1px 0;
 }
-</style></head>
-<body>
+</style>
+
 <div class="wrap">
   <header>
     <h1 id="hallTitle">游戏大厅</h1>
@@ -832,8 +832,8 @@ var HALL_DEDICATION = "谨以此，纪念那些被我们笑过、也被我们记
      ADMIN_PASS_HASH  hallPassHash(密码) 的结果，固定 16 位十六进制小写
    默认密码：banzhongwang　（第一次进面板后建议在「F · 安全设置」里改掉）
    想手工改：浏览器控制台执行 hallPassHash("你的新密码")，把返回值填进 ADMIN_PASS_HASH */
-var ADMIN_SALT = "74743da0ee0c";
-var ADMIN_PASS_HASH = "a930eb04b461c6c8";
+var ADMIN_SALT = "b891c5021b97";
+var ADMIN_PASS_HASH = "aa872835db1e75c5";
 /* 纯 JS 小哈希：FNV-1a(32) 与 djb2(32) 加盐后互相掺混三轮，输出 16 位十六进制。
    故意不用 crypto.subtle —— file:// 双击打开时它在浏览器里是 undefined。
    定位是「不让人随手翻一下源码就进面板」，不是强加密，别拿它保护要紧东西。 */
@@ -863,28 +863,40 @@ var GAMES = [
     desc: "同学头像合成小游戏：两个相同头像碰到一起就升级，合出最大级触发全屏庆祝。",
     url: "https://merge-games.github.io/merge-yanglukai/",
     cover: "https://merge-games.github.io/merge-yanglukai/assets/level_6.jpg",
-    tag: "合成"
+    tag: "合成",
+    on: false
   },
   {
     title: "跳一跳 · 璐恺版",
     desc: "按住蓄力、松手起跳，落在方块上得分；方块上的人一路换成十二钗，正中圆心有完美加成。",
     url: "https://merge-games.github.io/jump-yanglukai/",
     cover: "https://merge-games.github.io/jump-yanglukai/assets/kai_02.jpg",
-    tag: "跳跃"
+    tag: "跳跃",
+    on: true
   },
   {
     title: "璐恺十二钗",
     desc: "后宫剧视觉小说：12 位钗争宠整活，选择刷好感，12 个专属结局 + 隐藏「十二钗齐聚」。",
     url: "https://merge-games.github.io/galgame-yanglukai/",
     cover: "https://merge-games.github.io/galgame-yanglukai/assets/kai_06.jpg",
-    tag: "剧情"
+    tag: "剧情",
+    on: false
   },
   {
     title: "切西瓜 · 璐恺版",
     desc: "水果忍者玩法：滑动切水果、连击加分，切到炸弹就结束；漏接炸弹不扣命。",
     url: "https://merge-games.github.io/fruit-yanglukai/",
     cover: "https://merge-games.github.io/fruit-yanglukai/assets/kai_09.jpg",
-    tag: "休闲"
+    tag: "休闲",
+    on: false
+  },
+  {
+    title: "华南理工大学",
+    desc: "华工官网",
+    url: "https://scut.edu.cn",
+    cover: "",
+    tag: "",
+    on: true
   }
 ];
 /* @@HALL-ADMIN-GAMES-END-v1@@ */
@@ -3056,4 +3068,4 @@ renderHall();
 </script>
 
 
-<div id="el-popper-container-1988"></div><doubao-ai-csui id="28e4ce65a72140e69e414e4b8301075f" data-host-id="7287f194-b194-4e68-9e44-46edf3a9d6ad"></doubao-ai-csui><div id="doubao-ai-translate-image-assistant7287f194-b194-4e68-9e44-46edf3a9d6ad" data-collection-img-host-id="7287f194-b194-4e68-9e44-46edf3a9d6ad"></div><div style="width: 0px; height: 0px; position: absolute; z-index: 200000;"></div><div id="doubao-ai-assistant" aria-label="flow-ai-assistant" class="flow-ai-select-bar-enabled flow-ai-select-bar-support-iframe" aria-description="flow-ai-select-bar-enabled flow-ai-select-bar-support-iframe" style="width: 0px; height: 0px; position: absolute; top: 0px; left: 0px; overflow: hidden;"></div></body><div id="immersive-translate-popup" style="all: initial"></div></html>
+<div id="el-popper-container-1988"></div><doubao-ai-csui id="28e4ce65a72140e69e414e4b8301075f" data-host-id="7287f194-b194-4e68-9e44-46edf3a9d6ad"></doubao-ai-csui><div id="doubao-ai-translate-image-assistant7287f194-b194-4e68-9e44-46edf3a9d6ad" data-collection-img-host-id="7287f194-b194-4e68-9e44-46edf3a9d6ad"></div><div style="width: 0px; height: 0px; position: absolute; z-index: 200000;"></div><div id="doubao-ai-assistant" aria-label="flow-ai-assistant" class="flow-ai-select-bar-enabled flow-ai-select-bar-support-iframe" aria-description="flow-ai-select-bar-enabled flow-ai-select-bar-support-iframe" style="width: 0px; height: 0px; position: absolute; top: 0px; left: 0px; overflow: hidden;"></div><div id="immersive-translate-popup" style="all: initial"></div></body></html>
