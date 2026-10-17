@@ -1459,6 +1459,26 @@ renderHall();
      - 去掉面板注入的节点（#hallAdminRoot / #hallAdminStyle）与诊断属性
      - 清空运行时渲染出来的卡片，避免把渲染结果写死进文件
      - 补回 doctype（documentElement.outerHTML 不含 doctype，缺了会进怪异模式） */
+  
+  /* 清洗浏览器扩展/翻译插件注入到页面里的东西（沉浸式翻译、豆包侧边栏、Plasmo 等） */
+  function sanitizeThirdParty(html) {
+    var junk = [
+      /<plasmo-csui[\s\S]*?<\/plasmo-csui>/gi,
+      /<doubao-ai-csui[\s\S]*?<\/doubao-ai-csui>/gi,
+      /<div id="doubao-ai-translate-image-assistant[^"]*"[\s\S]*?<\/div>/gi,
+      /<div id="doubao-ai-assistant"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/gi,
+      /<div id="immersive-translate-[^"]*"[\s\S]*?<\/div>/gi,
+      /<div id="el-popper-container-\d+"[^>]*><\/div>/gi
+    ];
+    for (var i = 0; i < junk.length; i++) html = html.replace(junk[i], "");
+    html = html.replace(/\sdata-immersive-translate-page-theme="[^"]*"/g, "")
+               .replace(/\sdata-host-id="[^"]*"/g, "")
+               .replace(/\sdata-collection-img-host-id="[^"]*"/g, "")
+               .replace(/<head><\/head><body>/gi, "<head>");
+    var bad = /plasmo-csui|doubao-ai-csui|immersive-translate-|el-popper-container-/i;
+    return { html: html, dirty: bad.test(html) };
+  }
+
   function cleanSource() {
     var root = document.documentElement.cloneNode(true);
     var doomed = root.querySelectorAll("#hallAdminRoot,#hallAdminStyle");
